@@ -19,7 +19,8 @@ Built up incrementally:
 * `_running_output_kernel` -- adds the output accumulator. Online softmax is
   complete here; steps 9-10 are assembly and masking.
 * `_fwd_kernel` / `flash_attention_forward` -- the assembled forward pass,
-  normalized in-kernel and returning the input dtype. This is the public API.
+  normalized in-kernel and returning the input dtype, with causal masking.
+  This is the public API.
 
 The earlier kernels are kept deliberately. In a production repo they would be
 dead code; here each one pins down a single idea and has a test suite proving
@@ -824,6 +825,7 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
 ):
     """The complete FlashAttention-2 forward pass.
 
@@ -836,6 +838,15 @@ def _fwd_kernel(
 
     l >= 1 always -- the row-max term contributes exp(0) = 1 -- so the division
     needs no zero guard.
+
+    Causal masking stops the inner loop at the diagonal rather than masking
+    every block. K/V blocks strictly above the diagonal are never loaded, so
+    causal attention does about half the work of non-causal.
+
+    That also keeps the arithmetic safe. Had the loop run to N_CTX and masked,
+    an entirely-masked block would leave m = -inf, making alpha = exp(-inf +
+    inf) = NaN. Stopping at the diagonal guarantees every row sees at least its
+    own diagonal element, so m is always finite.
     """
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -857,7 +868,14 @@ def _fwd_kernel(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
-    for start_n in range(0, N_CTX, BLOCK_N):
+    # Causal rows never look past their own index, so the loop stops at the
+    # last block containing the diagonal. Everything above it is skipped.
+    if IS_CAUSAL:
+        hi = tl.minimum((start_m + 1) * BLOCK_M, N_CTX)
+    else:
+        hi = N_CTX
+
+    for start_n in range(0, hi, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
 
         k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
@@ -867,6 +885,13 @@ def _fwd_kernel(
 
         s = tl.dot(q, tl.trans(k)) * sm_scale
         s = tl.where(offs_n[None, :] < N_CTX, s, float("-inf"))
+
+        # Only blocks straddling the diagonal actually need this; blocks fully
+        # below it are entirely valid. Applying it uniformly is correct but
+        # leaves non-matmul work in the hot loop -- splitting the loop into an
+        # unmasked range plus a masked diagonal range is a Phase 5 tuning item.
+        if IS_CAUSAL:
+            s = tl.where(offs_m[:, None] >= offs_n[None, :], s, float("-inf"))
 
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
         alpha = tl.exp(m_i - m_new)
@@ -895,7 +920,7 @@ def flash_attention_forward(
 
     Args:
         q, k, v: (B, H, N, D), same dtype and device. D must be a power of two.
-        causal: not yet supported -- added in step 10.
+        causal: if True, position i attends only to positions j <= i.
         sm_scale: defaults to 1/sqrt(D).
         block_m, block_n: tile sizes. Default to a heuristic based on D.
 
@@ -908,9 +933,6 @@ def flash_attention_forward(
         raise ValueError(f"q/k/v must share a dtype, got {q.dtype}, {k.dtype}, {v.dtype}")
     if q.dim() != 4:
         raise ValueError(f"expected 4D (B, H, N, D) tensors, got {q.dim()}D")
-    if causal:
-        raise NotImplementedError("causal masking arrives in step 10")
-
     b, h, n, d = q.shape
     if d & (d - 1) != 0:
         raise ValueError(f"head_dim must be a power of two, got {d}")
@@ -954,6 +976,7 @@ def flash_attention_forward(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=d,
+        IS_CAUSAL=causal,
         num_warps=num_warps,
     )
     return o

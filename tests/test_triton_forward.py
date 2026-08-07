@@ -125,12 +125,6 @@ def test_default_scale_is_one_over_sqrt_d():
     torch.testing.assert_close(default, explicit)
 
 
-def test_causal_is_not_yet_supported():
-    q, k, v = (torch.randn(1, 1, 64, 64, device="cuda", dtype=torch.float16) for _ in range(3))
-    with pytest.raises(NotImplementedError, match="step 10"):
-        flash_attention_forward(q, k, v, causal=True)
-
-
 def test_rejects_mixed_dtypes():
     q = torch.randn(1, 1, 64, 64, device="cuda", dtype=torch.float16)
     v = torch.randn(1, 1, 64, 64, device="cuda", dtype=torch.float32)
