@@ -1,10 +1,13 @@
 """FlashAttention-2 forward pass in Triton.
 
-Built up incrementally. Right now this holds only the skeleton: a kernel that
-loads one Q tile and stores it back unchanged. It computes nothing, but it
-exercises the full plumbing -- grid launch, program IDs, strided tile loads,
-boundary masking, stores -- so that later steps debug arithmetic rather than
-addressing.
+Built up incrementally:
+
+* `_copy_q_kernel` -- the skeleton. Loads one Q tile and stores it back
+  unchanged. Computes nothing, but exercises the full plumbing (grid launch,
+  program IDs, strided tile loads, boundary masking, stores) so that later
+  steps debug arithmetic rather than addressing.
+* `_qk_tile_kernel` -- one tile of S = QK^T / sqrt(d). Introduces `tl.dot`
+  and the fp32 accumulator.
 
 Tiles are addressed with explicit pointer arithmetic rather than
 `tl.make_block_ptr`. The block-pointer API's main advantage is enabling TMA on
@@ -14,6 +17,8 @@ the index math visible.
 Importing this module requires Triton, which is Linux/GPU-only. It is
 deliberately not imported from `flash_attn/__init__.py`.
 """
+
+import math
 
 import torch
 import triton
@@ -100,3 +105,128 @@ def copy_q(q: torch.Tensor, block_m: int = 128) -> torch.Tensor:
         HEAD_DIM=d,
     )
     return o
+
+
+@triton.jit
+def _qk_tile_kernel(
+    Q,
+    K,
+    S,
+    stride_qb,
+    stride_qh,
+    stride_qm,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_sb,
+    stride_sh,
+    stride_sm,
+    stride_sn,
+    H,
+    N_CTX,
+    sm_scale,
+    start_m,
+    start_n,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """Compute a single (BLOCK_M, BLOCK_N) tile of S = QK^T / sqrt(d).
+
+    One program per (batch, head); the tile indices `start_m`/`start_n` are
+    runtime arguments so a test can ask for any specific tile.
+
+    On sm_86 `tl.dot` lowers to the tensor-core MMA path, which requires every
+    dimension to be at least 16 -- so BLOCK_M, BLOCK_N and HEAD_DIM all have a
+    hard floor of 16.
+    """
+    off_hz = tl.program_id(0)
+    off_b = off_hz // H
+    off_h = off_hz % H
+
+    q_base = Q + off_b * stride_qb + off_h * stride_qh
+    k_base = K + off_b * stride_kb + off_h * stride_kh
+    s_base = S + off_b * stride_sb + off_h * stride_sh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)  # rows of Q
+    offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)  # rows of K
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+    k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+
+    # Out-of-range rows load as 0. A zero row contributes 0 to the dot product,
+    # so the garbage stays confined to tile entries the caller already knows
+    # are invalid -- it never contaminates a valid entry.
+    q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)  # (BLOCK_M, HEAD_DIM)
+    k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)  # (BLOCK_N, HEAD_DIM)
+
+    # K is stored (N, D) like Q, so transpose to (D, BLOCK_N) for the matmul.
+    # tl.dot accumulates in fp32 even though the inputs are fp16: fp16 has only
+    # ~3 decimal digits, and summing HEAD_DIM products in fp16 would lose
+    # precision that the softmax then amplifies.
+    s = tl.dot(q, tl.trans(k))  # (BLOCK_M, BLOCK_N), fp32
+    s = s * sm_scale
+
+    # Tile-local output: the (m, n) tile is written to S[:, :, :BLOCK_M, :BLOCK_N].
+    offs_sm = tl.arange(0, BLOCK_M)
+    offs_sn = tl.arange(0, BLOCK_N)
+    s_ptrs = s_base + offs_sm[:, None] * stride_sm + offs_sn[None, :] * stride_sn
+    tl.store(s_ptrs, s)
+
+
+def qk_tile(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    start_m: int = 0,
+    start_n: int = 0,
+    block_m: int = 64,
+    block_n: int = 64,
+    sm_scale: float | None = None,
+) -> torch.Tensor:
+    """Compute one tile of the score matrix S = QK^T / sqrt(d).
+
+    Args:
+        q, k: (B, H, N, D) tensors.
+        start_m, start_n: which tile, in units of `block_m` / `block_n`.
+        sm_scale: defaults to 1/sqrt(D).
+
+    Returns:
+        (B, H, block_m, block_n) fp32 tile. Entries whose row or column falls
+        past N are zero-padded and carry no meaning.
+    """
+    if q.shape != k.shape:
+        raise ValueError(f"q and k must share a shape, got {q.shape}, {k.shape}")
+    b, h, n, d = q.shape
+    for name, value in (("block_m", block_m), ("block_n", block_n), ("head_dim", d)):
+        if value < 16:
+            raise ValueError(f"{name} must be >= 16 for the tensor-core path, got {value}")
+    if d & (d - 1) != 0:
+        raise ValueError(f"head_dim must be a power of two, got {d}")
+
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(d)
+
+    # fp32 output: tl.dot accumulates in fp32 and we keep that precision, since
+    # the running softmax statistics downstream are maintained in fp32 too.
+    s = torch.empty((b, h, block_m, block_n), device=q.device, dtype=torch.float32)
+
+    _qk_tile_kernel[(b * h,)](
+        q,
+        k,
+        s,
+        *q.stride(),
+        *k.stride(),
+        *s.stride(),
+        h,
+        n,
+        sm_scale,
+        start_m,
+        start_n,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=d,
+    )
+    return s
