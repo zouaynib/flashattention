@@ -18,6 +18,12 @@ Built up incrementally:
   factor alpha = exp(m_old - m_new). This is the core of online softmax.
 * `_running_output_kernel` -- adds the output accumulator. Online softmax is
   complete here; steps 9-10 are assembly and masking.
+* `_fwd_kernel` / `flash_attention_forward` -- the assembled forward pass,
+  normalized in-kernel and returning the input dtype. This is the public API.
+
+The earlier kernels are kept deliberately. In a production repo they would be
+dead code; here each one pins down a single idea and has a test suite proving
+it, which is the point of the project.
 
 Tiles are addressed with explicit pointer arithmetic rather than
 `tl.make_block_ptr`. The block-pointer API's main advantage is enabling TMA on
@@ -788,3 +794,166 @@ def running_output_accumulator(
         HEAD_DIM=d,
     )
     return o, m, l
+
+
+@triton.jit
+def _fwd_kernel(
+    Q,
+    K,
+    V,
+    O,
+    stride_qb,
+    stride_qh,
+    stride_qm,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_om,
+    stride_od,
+    H,
+    N_CTX,
+    sm_scale,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """The complete FlashAttention-2 forward pass.
+
+    Q-block outer loop (the grid), K/V-block inner loop (below). One Q tile is
+    held in registers while K and V stream past it once, so HBM traffic is
+    O(N^2 d / M) instead of the O(N^2) of a materialized score matrix.
+
+    Normalization happens here, before the store: dividing in PyTorch afterwards
+    would mean another full read-modify-write of O through HBM.
+
+    l >= 1 always -- the row-max term contributes exp(0) = 1 -- so the division
+    needs no zero guard.
+    """
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_b = off_hz // H
+    off_h = off_hz % H
+
+    q_base = Q + off_b * stride_qb + off_h * stride_qh
+    k_base = K + off_b * stride_kb + off_h * stride_kh
+    v_base = V + off_b * stride_vb + off_h * stride_vh
+    o_base = O + off_b * stride_ob + off_h * stride_oh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+    q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    for start_n in range(0, N_CTX, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+
+        k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+        v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+        k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
+        v = tl.load(v_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
+
+        s = tl.dot(q, tl.trans(k)) * sm_scale
+        s = tl.where(offs_n[None, :] < N_CTX, s, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(s - m_new[:, None])
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        m_i = m_new
+
+    acc = acc / l_i[:, None]
+
+    o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+    tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=offs_m[:, None] < N_CTX)
+
+
+def flash_attention_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool = False,
+    sm_scale: float | None = None,
+    block_m: int | None = None,
+    block_n: int | None = None,
+) -> torch.Tensor:
+    """FlashAttention-2 forward pass.
+
+    Args:
+        q, k, v: (B, H, N, D), same dtype and device. D must be a power of two.
+        causal: not yet supported -- added in step 10.
+        sm_scale: defaults to 1/sqrt(D).
+        block_m, block_n: tile sizes. Default to a heuristic based on D.
+
+    Returns:
+        (B, H, N, D) attention output, in the input dtype.
+    """
+    if not (q.shape == k.shape == v.shape):
+        raise ValueError(f"q/k/v must share a shape, got {q.shape}, {k.shape}, {v.shape}")
+    if not (q.dtype == k.dtype == v.dtype):
+        raise ValueError(f"q/k/v must share a dtype, got {q.dtype}, {k.dtype}, {v.dtype}")
+    if q.dim() != 4:
+        raise ValueError(f"expected 4D (B, H, N, D) tensors, got {q.dim()}D")
+    if causal:
+        raise NotImplementedError("causal masking arrives in step 10")
+
+    b, h, n, d = q.shape
+    if d & (d - 1) != 0:
+        raise ValueError(f"head_dim must be a power of two, got {d}")
+    if d < 16:
+        raise ValueError(f"head_dim must be >= 16 for the tensor-core path, got {d}")
+
+    # Heuristic rather than autotuning: @triton.autotune recompiles across the
+    # config space per shape, which would contaminate the Phase 5 latency
+    # measurements. Tuning belongs with the benchmark harness, where the
+    # tradeoff is measurable.
+    if block_m is None:
+        block_m = 64 if d >= 128 else 128
+    if block_n is None:
+        block_n = 64
+    for name, value in (("block_m", block_m), ("block_n", block_n)):
+        if value < 16:
+            raise ValueError(f"{name} must be >= 16 for the tensor-core path, got {value}")
+
+    # A 64x128 fp32 accumulator is already ~64 registers per thread at 4 warps;
+    # widening to 8 warps halves the per-thread pressure at large head dims.
+    num_warps = 8 if d >= 128 else 4
+
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(d)
+
+    o = torch.empty_like(q)
+    grid = (triton.cdiv(n, block_m), b * h)
+
+    _fwd_kernel[grid](
+        q,
+        k,
+        v,
+        o,
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *o.stride(),
+        h,
+        n,
+        sm_scale,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=d,
+        num_warps=num_warps,
+    )
+    return o
