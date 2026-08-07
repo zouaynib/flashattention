@@ -14,6 +14,8 @@ Built up incrementally:
 * `_running_max_kernel` -- the first online step. Loops over every K block
   tracking a running row max, and introduces the FA-2 structure where Q is
   loaded once and K/V stream past it.
+* `_running_sum_kernel` -- adds the running denominator l and the rescaling
+  factor alpha = exp(m_old - m_new). This is the core of online softmax.
 
 Tiles are addressed with explicit pointer arithmetic rather than
 `tl.make_block_ptr`. The block-pointer API's main advantage is enabling TMA on
@@ -492,3 +494,139 @@ def running_max(
         HEAD_DIM=d,
     )
     return m
+
+
+@triton.jit
+def _running_sum_kernel(
+    Q,
+    K,
+    M,
+    L,
+    stride_qb,
+    stride_qh,
+    stride_qm,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_mb,
+    stride_mh,
+    stride_mm,
+    H,
+    N_CTX,
+    sm_scale,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """Online softmax denominator: running max AND running sum, with rescaling.
+
+    When a later block raises the running max, every term already accumulated
+    into l was exponentiated against a stale, too-small maximum. They are all
+    wrong by the SAME factor, so a single multiply repairs the whole sum:
+
+        alpha^(t) = exp(m^(t-1) - m^(t))
+        l^(t)     = alpha^(t) * l^(t-1) + sum_j exp(s^(t)_j - m^(t))
+
+    This is the heart of FlashAttention: a summary of arbitrarily many past
+    keys can be retroactively corrected in O(1) per row. alpha is always in
+    (0, 1], so rescaling only ever shrinks past contributions -- it cannot
+    overflow.
+
+    On the first iteration m^(0) = -inf gives alpha = 0, which correctly zeroes
+    the empty accumulator. That relies on every row seeing at least one valid
+    key; causal masking (step 10) breaks that assumption and needs care.
+    """
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_b = off_hz // H
+    off_h = off_hz % H
+
+    q_base = Q + off_b * stride_qb + off_h * stride_qh
+    k_base = K + off_b * stride_kb + off_h * stride_kh
+    m_base = M + off_b * stride_mb + off_h * stride_mh
+    l_base = L + off_b * stride_mb + off_h * stride_mh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+    q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+
+    for start_n in range(0, N_CTX, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+        k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
+
+        s = tl.dot(q, tl.trans(k)) * sm_scale
+        s = tl.where(offs_n[None, :] < N_CTX, s, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+
+        # The correction factor. Everything accumulated so far was measured
+        # against m_i; this converts it to the m_new scale.
+        alpha = tl.exp(m_i - m_new)
+
+        # Masked entries are -inf, so exp(-inf - m_new) == 0: no weight.
+        p = tl.exp(s - m_new[:, None])
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    tl.store(m_base + offs_m * stride_mm, m_i, mask=offs_m < N_CTX)
+    tl.store(l_base + offs_m * stride_mm, l_i, mask=offs_m < N_CTX)
+
+
+def running_softmax_stats(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    block_m: int = 64,
+    block_n: int = 64,
+    sm_scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Softmax statistics for every row of S, computed online over K blocks.
+
+    Returns:
+        m: (B, H, N) row maxima.
+        l: (B, H, N) softmax denominators, sum_j exp(s_ij - m_i).
+
+        The true softmax of row i is exp(s_ij - m_i) / l_i -- computed here
+        without ever materializing a full row of S.
+    """
+    if q.shape != k.shape:
+        raise ValueError(f"q and k must share a shape, got {q.shape}, {k.shape}")
+    b, h, n, d = q.shape
+    for name, value in (("block_m", block_m), ("block_n", block_n), ("head_dim", d)):
+        if value < 16:
+            raise ValueError(f"{name} must be >= 16 for the tensor-core path, got {value}")
+    if d & (d - 1) != 0:
+        raise ValueError(f"head_dim must be a power of two, got {d}")
+
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(d)
+
+    m = torch.empty((b, h, n), device=q.device, dtype=torch.float32)
+    l = torch.empty((b, h, n), device=q.device, dtype=torch.float32)
+
+    grid = (triton.cdiv(n, block_m), b * h)
+
+    _running_sum_kernel[grid](
+        q,
+        k,
+        m,
+        l,
+        *q.stride(),
+        *k.stride(),
+        *m.stride(),
+        h,
+        n,
+        sm_scale,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=d,
+    )
+    return m, l
