@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-attn-from-scratch"
+version = "0.1.0"
+description = "FlashAttention-2 implemented from scratch as a Triton kernel, with benchmarks and an interactive explainer"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "numpy>=1.24", "matplotlib>=3.8", "pandas>=2.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires a CUDA device and Triton (skipped automatically on CPU-only machines)",
+]

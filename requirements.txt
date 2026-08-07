@@ -1,0 +1,11 @@
+# PyTorch is preinstalled on the RunPod PyTorch template; installing there is a no-op.
+# Locally (macOS) this pulls the CPU build, which is enough for the naive baseline.
+torch>=2.1
+
+# Triton is intentionally NOT listed: it ships with PyTorch on Linux and has no
+# macOS wheels. Listing it would make `pip install -r requirements.txt` fail on a Mac.
+
+pytest>=8.0
+numpy>=1.24
+matplotlib>=3.8
+pandas>=2.0
