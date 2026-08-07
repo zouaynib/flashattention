@@ -16,6 +16,8 @@ Built up incrementally:
   loaded once and K/V stream past it.
 * `_running_sum_kernel` -- adds the running denominator l and the rescaling
   factor alpha = exp(m_old - m_new). This is the core of online softmax.
+* `_running_output_kernel` -- adds the output accumulator. Online softmax is
+  complete here; steps 9-10 are assembly and masking.
 
 Tiles are addressed with explicit pointer arithmetic rather than
 `tl.make_block_ptr`. The block-pointer API's main advantage is enabling TMA on
@@ -630,3 +632,159 @@ def running_softmax_stats(
         HEAD_DIM=d,
     )
     return m, l
+
+
+@triton.jit
+def _running_output_kernel(
+    Q,
+    K,
+    V,
+    O,
+    M,
+    L,
+    stride_qb,
+    stride_qh,
+    stride_qm,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_om,
+    stride_od,
+    stride_mb,
+    stride_mh,
+    stride_mm,
+    H,
+    N_CTX,
+    sm_scale,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """Online softmax, complete: running max, running sum, running output.
+
+    The output accumulator takes the same correction as the denominator, just
+    broadcast across the head dimension:
+
+        O^(t) = alpha^(t) * O^(t-1) + P^(t) V^(t)
+
+    and the attention output is O^(T) / l^(T) once the loop ends.
+
+    Normalization is deferred to the very end rather than applied per block.
+    That is the FlashAttention-2 change over FA-1: it removes a divide from the
+    inner loop, and non-matmul work is roughly an order of magnitude less
+    efficient than tensor-core matmul on this hardware.
+    """
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_b = off_hz // H
+    off_h = off_hz % H
+
+    q_base = Q + off_b * stride_qb + off_h * stride_qh
+    k_base = K + off_b * stride_kb + off_h * stride_kh
+    v_base = V + off_b * stride_vb + off_h * stride_vh
+    o_base = O + off_b * stride_ob + off_h * stride_oh
+    m_base = M + off_b * stride_mb + off_h * stride_mh
+    l_base = L + off_b * stride_mb + off_h * stride_mh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+    q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+    for start_n in range(0, N_CTX, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+
+        k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+        v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+        k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
+        v = tl.load(v_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
+
+        s = tl.dot(q, tl.trans(k)) * sm_scale
+        s = tl.where(offs_n[None, :] < N_CTX, s, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(s - m_new[:, None])
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+
+        # Same correction, broadcast over the head dimension. P is cast to the
+        # input dtype so this hits tensor cores; the accumulator stays fp32.
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+
+        m_i = m_new
+
+    o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
+    tl.store(o_ptrs, acc, mask=offs_m[:, None] < N_CTX)
+    tl.store(m_base + offs_m * stride_mm, m_i, mask=offs_m < N_CTX)
+    tl.store(l_base + offs_m * stride_mm, l_i, mask=offs_m < N_CTX)
+
+
+def running_output_accumulator(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_m: int = 64,
+    block_n: int = 64,
+    sm_scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Unnormalized attention output plus its softmax statistics.
+
+    Returns:
+        o: (B, H, N, D) fp32, the UNNORMALIZED accumulator sum_j exp(s_ij - m_i) v_j.
+        m: (B, H, N) row maxima.
+        l: (B, H, N) softmax denominators.
+
+        Attention output is o / l[..., None]. Step 9 wraps that up.
+    """
+    if not (q.shape == k.shape == v.shape):
+        raise ValueError(f"q/k/v must share a shape, got {q.shape}, {k.shape}, {v.shape}")
+    b, h, n, d = q.shape
+    for name, value in (("block_m", block_m), ("block_n", block_n), ("head_dim", d)):
+        if value < 16:
+            raise ValueError(f"{name} must be >= 16 for the tensor-core path, got {value}")
+    if d & (d - 1) != 0:
+        raise ValueError(f"head_dim must be a power of two, got {d}")
+
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(d)
+
+    o = torch.empty((b, h, n, d), device=q.device, dtype=torch.float32)
+    m = torch.empty((b, h, n), device=q.device, dtype=torch.float32)
+    l = torch.empty((b, h, n), device=q.device, dtype=torch.float32)
+
+    grid = (triton.cdiv(n, block_m), b * h)
+
+    _running_output_kernel[grid](
+        q,
+        k,
+        v,
+        o,
+        m,
+        l,
+        *q.stride(),
+        *k.stride(),
+        *v.stride(),
+        *o.stride(),
+        *m.stride(),
+        h,
+        n,
+        sm_scale,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=d,
+    )
+    return o, m, l
