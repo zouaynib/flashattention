@@ -11,6 +11,9 @@ Built up incrementally:
 * `_softmax_tile_kernel` -- safe softmax over that one tile. Introduces the
   max/exp/sum machinery and the -inf masking of out-of-range keys. Not yet
   online: the denominator covers one K block, not the whole row.
+* `_running_max_kernel` -- the first online step. Loops over every K block
+  tracking a running row max, and introduces the FA-2 structure where Q is
+  loaded once and K/V stream past it.
 
 Tiles are addressed with explicit pointer arithmetic rather than
 `tl.make_block_ptr`. The block-pointer API's main advantage is enabling TMA on
@@ -374,3 +377,118 @@ def softmax_tile(
         HEAD_DIM=d,
     )
     return p, m, l
+
+
+@triton.jit
+def _running_max_kernel(
+    Q,
+    K,
+    M,
+    stride_qb,
+    stride_qh,
+    stride_qm,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_mb,
+    stride_mh,
+    stride_mm,
+    H,
+    N_CTX,
+    sm_scale,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """Track the row max of S online, across every K block.
+
+    Safe softmax needs max_j s_ij over the whole row, but the row is N wide and
+    does not fit in SRAM -- that is the premise of the whole algorithm. So the
+    max is accumulated one block at a time:
+
+        m^(t) = max(m^(t-1), max_j s^(t)_ij),   m^(0) = -inf
+
+    After the final block m equals the true row max.
+
+    Note the structure: the Q block is loaded ONCE, before the loop, and K
+    blocks stream past it. That asymmetry is FlashAttention-2 -- Q stays
+    resident in registers while K/V are read from HBM once each.
+    """
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_b = off_hz // H
+    off_h = off_hz % H
+
+    q_base = Q + off_b * stride_qb + off_h * stride_qh
+    k_base = K + off_b * stride_kb + off_h * stride_kh
+    m_base = M + off_b * stride_mb + off_h * stride_mh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    # Loaded once and reused for every K block below.
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+    q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+
+    m = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+
+    for start_n in range(0, N_CTX, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+        k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
+
+        s = tl.dot(q, tl.trans(k)) * sm_scale
+        s = tl.where(offs_n[None, :] < N_CTX, s, float("-inf"))
+
+        m = tl.maximum(m, tl.max(s, axis=1))
+
+    tl.store(m_base + offs_m * stride_mm, m, mask=offs_m < N_CTX)
+
+
+def running_max(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    block_m: int = 64,
+    block_n: int = 64,
+    sm_scale: float | None = None,
+) -> torch.Tensor:
+    """Row maxima of S = QK^T / sqrt(d), computed online over K blocks.
+
+    Returns:
+        (B, H, N) fp32 tensor equal to S.max(dim=-1) -- but computed without
+        ever materializing a full row of S.
+    """
+    if q.shape != k.shape:
+        raise ValueError(f"q and k must share a shape, got {q.shape}, {k.shape}")
+    b, h, n, d = q.shape
+    for name, value in (("block_m", block_m), ("block_n", block_n), ("head_dim", d)):
+        if value < 16:
+            raise ValueError(f"{name} must be >= 16 for the tensor-core path, got {value}")
+    if d & (d - 1) != 0:
+        raise ValueError(f"head_dim must be a power of two, got {d}")
+
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(d)
+
+    m = torch.empty((b, h, n), device=q.device, dtype=torch.float32)
+
+    # The real FlashAttention-2 grid: one program per (Q block, batch-head).
+    grid = (triton.cdiv(n, block_m), b * h)
+
+    _running_max_kernel[grid](
+        q,
+        k,
+        m,
+        *q.stride(),
+        *k.stride(),
+        *m.stride(),
+        h,
+        n,
+        sm_scale,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=d,
+    )
+    return m
