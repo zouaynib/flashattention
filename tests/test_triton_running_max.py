@@ -84,10 +84,15 @@ def test_padded_keys_never_win_the_max():
     """
     torch.manual_seed(0)
     b, h, n, d = 1, 1, 70, 32  # 70 = 64 + 6, so the last block is mostly padding
-    q, k = (torch.randn(b, h, n, d, device="cuda", dtype=torch.float16) for _ in range(2))
 
-    # Shift scores strongly negative so every true max is well below zero.
-    q = q - 8.0
+    # Every score must be negative for this test to mean anything. Shifting q by
+    # a constant does NOT achieve that -- it adds -c * sum_d(k_jd), whose sign
+    # varies per key, and a max over many keys then lands positive anyway.
+    # Instead make the sign structural: positive queries against negative keys
+    # gives an all-negative product, so a padded key masked to 0 rather than
+    # -inf would win every single row max.
+    q = torch.randn(b, h, n, d, device="cuda", dtype=torch.float16).abs() + 0.5
+    k = -(torch.randn(b, h, n, d, device="cuda", dtype=torch.float16).abs() + 0.5)
 
     got = running_max(q, k, block_m=64, block_n=64)
     want = _reference_max(q, k, 1.0 / math.sqrt(d))
