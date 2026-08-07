@@ -8,6 +8,9 @@ Built up incrementally:
   steps debug arithmetic rather than addressing.
 * `_qk_tile_kernel` -- one tile of S = QK^T / sqrt(d). Introduces `tl.dot`
   and the fp32 accumulator.
+* `_softmax_tile_kernel` -- safe softmax over that one tile. Introduces the
+  max/exp/sum machinery and the -inf masking of out-of-range keys. Not yet
+  online: the denominator covers one K block, not the whole row.
 
 Tiles are addressed with explicit pointer arithmetic rather than
 `tl.make_block_ptr`. The block-pointer API's main advantage is enabling TMA on
@@ -230,3 +233,144 @@ def qk_tile(
         HEAD_DIM=d,
     )
     return s
+
+
+@triton.jit
+def _softmax_tile_kernel(
+    Q,
+    K,
+    P,
+    M,
+    L,
+    stride_qb,
+    stride_qh,
+    stride_qm,
+    stride_qd,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kd,
+    stride_pb,
+    stride_ph,
+    stride_pm,
+    stride_pn,
+    stride_mb,
+    stride_mh,
+    stride_mm,
+    H,
+    N_CTX,
+    sm_scale,
+    start_m,
+    start_n,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """Safe softmax over a single (BLOCK_M, BLOCK_N) tile of S.
+
+    Computes, per row of the tile:
+        m = max_j s_j            (row max, for numerical safety)
+        p = exp(s - m)           (UNNORMALIZED -- see below)
+        l = sum_j p_j            (the partial denominator)
+
+    `p` is deliberately not divided by `l`. FlashAttention carries numerator
+    and denominator separately and normalizes once at the very end, because
+    `l` is still accumulating over later K blocks. Dividing here would bake in
+    a denominator that is about to change.
+
+    This is a correct softmax over the wrong set: the true denominator runs
+    over all N keys, not just this block's BLOCK_N. Steps 6-8 fix that.
+    """
+    off_hz = tl.program_id(0)
+    off_b = off_hz // H
+    off_h = off_hz % H
+
+    q_base = Q + off_b * stride_qb + off_h * stride_qh
+    k_base = K + off_b * stride_kb + off_h * stride_kh
+    p_base = P + off_b * stride_pb + off_h * stride_ph
+    m_base = M + off_b * stride_mb + off_h * stride_mh
+    l_base = L + off_b * stride_mb + off_h * stride_mh
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, HEAD_DIM)
+
+    q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+    k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+
+    q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+    k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
+
+    s = tl.dot(q, tl.trans(k)) * sm_scale
+
+    # Out-of-range KEYS must be -inf, not 0. A zero score becomes exp(0 - m),
+    # a positive weight, which would steal probability mass from real keys.
+    # This is invisible unless N_CTX is not a multiple of BLOCK_N.
+    s = tl.where(offs_n[None, :] < N_CTX, s, float("-inf"))
+
+    m = tl.max(s, axis=1)  # (BLOCK_M,)
+    p = tl.exp(s - m[:, None])  # (BLOCK_M, BLOCK_N), unnormalized
+    l = tl.sum(p, axis=1)  # (BLOCK_M,)
+
+    offs_pm = tl.arange(0, BLOCK_M)
+    offs_pn = tl.arange(0, BLOCK_N)
+    p_ptrs = p_base + offs_pm[:, None] * stride_pm + offs_pn[None, :] * stride_pn
+    tl.store(p_ptrs, p)
+    tl.store(m_base + offs_pm * stride_mm, m)
+    tl.store(l_base + offs_pm * stride_mm, l)
+
+
+def softmax_tile(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    start_m: int = 0,
+    start_n: int = 0,
+    block_m: int = 64,
+    block_n: int = 64,
+    sm_scale: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Safe softmax over one tile of S = QK^T / sqrt(d).
+
+    Returns:
+        p: (B, H, block_m, block_n) unnormalized weights exp(s - m).
+        m: (B, H, block_m) row maxima over this tile.
+        l: (B, H, block_m) row sums of `p` over this tile.
+
+        The normalized softmax of the tile is `p / l[..., None]`.
+    """
+    if q.shape != k.shape:
+        raise ValueError(f"q and k must share a shape, got {q.shape}, {k.shape}")
+    b, h, n, d = q.shape
+    for name, value in (("block_m", block_m), ("block_n", block_n), ("head_dim", d)):
+        if value < 16:
+            raise ValueError(f"{name} must be >= 16 for the tensor-core path, got {value}")
+    if d & (d - 1) != 0:
+        raise ValueError(f"head_dim must be a power of two, got {d}")
+
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(d)
+
+    p = torch.empty((b, h, block_m, block_n), device=q.device, dtype=torch.float32)
+    m = torch.empty((b, h, block_m), device=q.device, dtype=torch.float32)
+    l = torch.empty((b, h, block_m), device=q.device, dtype=torch.float32)
+
+    _softmax_tile_kernel[(b * h,)](
+        q,
+        k,
+        p,
+        m,
+        l,
+        *q.stride(),
+        *k.stride(),
+        *p.stride(),
+        *m.stride(),
+        h,
+        n,
+        sm_scale,
+        start_m,
+        start_n,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=d,
+    )
+    return p, m, l
