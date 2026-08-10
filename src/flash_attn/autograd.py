@@ -29,6 +29,16 @@ class FlashAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale):
+        # The forward kernel handles grouped-query attention, but the backward
+        # kernels do not yet. Refusing here is better than returning gradients
+        # of the wrong shape or, worse, quietly wrong values.
+        if q.shape[1] != k.shape[1]:
+            raise NotImplementedError(
+                "grouped-query attention is forward-only for now; the backward "
+                "pass gains it in step 19. Use flash_attention_forward directly "
+                "for inference."
+            )
+
         # Resolve the default here, once. If backward re-derived it separately,
         # a caller passing an explicit scale to forward would get gradients
         # computed against a different scale -- silently.

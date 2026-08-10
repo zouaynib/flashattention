@@ -835,6 +835,7 @@ def _fwd_kernel(
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
 ):
     """The complete FlashAttention-2 forward pass.
 
@@ -857,6 +858,12 @@ def _fwd_kernel(
     inf) = NaN. Stopping at the diagonal guarantees every row sees at least its
     own diagonal element, so m is always finite.
 
+    Supports grouped-query attention: GROUP_SIZE query heads share one K/V
+    head, so query head h reads KV head h // GROUP_SIZE. K and V are addressed
+    through that mapping rather than being replicated to H_q heads -- expanding
+    them would discard exactly the memory saving GQA exists for. GROUP_SIZE = 1
+    is ordinary multi-head attention.
+
     Also writes the log-sum-exp L = m + log(l), one fp32 value per query row.
     That single number is all the backward pass needs to rebuild any attention
     probability, since p_ij = exp(s_ij - L_i). Storing P itself would cost
@@ -865,11 +872,12 @@ def _fwd_kernel(
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
     off_b = off_hz // H
-    off_h = off_hz % H
+    off_h = off_hz % H  # query head
+    off_h_kv = off_h // GROUP_SIZE  # the K/V head it shares
 
     q_base = Q + off_b * stride_qb + off_h * stride_qh
-    k_base = K + off_b * stride_kb + off_h * stride_kh
-    v_base = V + off_b * stride_vb + off_h * stride_vh
+    k_base = K + off_b * stride_kb + off_h_kv * stride_kh
+    v_base = V + off_b * stride_vb + off_h_kv * stride_vh
     o_base = O + off_b * stride_ob + off_h * stride_oh
     l_base = L + off_b * stride_lb + off_h * stride_lh
 
@@ -939,7 +947,9 @@ def flash_attention_forward(
     """FlashAttention-2 forward pass.
 
     Args:
-        q, k, v: (B, H, N, D), same dtype and device. D must be a power of two.
+        q: (B, H_q, N, D).
+        k, v: (B, H_kv, N, D). H_q must be a multiple of H_kv -- pass H_kv <
+            H_q for grouped-query attention, or H_kv = 1 for multi-query.
         causal: if True, position i attends only to positions j <= i.
         return_lse: also return the per-row log-sum-exp, which the backward
             pass uses to recompute attention probabilities blockwise.
@@ -950,17 +960,28 @@ def flash_attention_forward(
         (B, H, N, D) attention output in the input dtype, or a tuple of that
         plus the (B, H, N) fp32 log-sum-exp when `return_lse` is set.
     """
-    if not (q.shape == k.shape == v.shape):
-        raise ValueError(f"q/k/v must share a shape, got {q.shape}, {k.shape}, {v.shape}")
+    if k.shape != v.shape:
+        raise ValueError(f"k and v must share a shape, got {k.shape}, {v.shape}")
+    if q.dim() != 4 or k.dim() != 4:
+        raise ValueError("expected 4D (B, H, N, D) tensors")
+    if q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:]:
+        raise ValueError(
+            f"q and k/v may differ only in head count, got {q.shape} and {k.shape}"
+        )
+    if q.shape[1] % k.shape[1] != 0:
+        raise ValueError(
+            f"query heads must be a multiple of kv heads (grouped-query attention), "
+            f"got {q.shape[1]} and {k.shape[1]}"
+        )
     if not (q.dtype == k.dtype == v.dtype):
         raise ValueError(f"q/k/v must share a dtype, got {q.dtype}, {k.dtype}, {v.dtype}")
     if q.dtype not in SUPPORTED_DTYPES:
         raise ValueError(
             f"only fp16 and bf16 are supported (the tensor-core dtypes), got {q.dtype}"
         )
-    if q.dim() != 4:
-        raise ValueError(f"expected 4D (B, H, N, D) tensors, got {q.dim()}D")
     b, h, n, d = q.shape
+    # How many query heads share each K/V head. 1 is ordinary multi-head.
+    group_size = h // k.shape[1]
     if d & (d - 1) != 0:
         raise ValueError(f"head_dim must be a power of two, got {d}")
     if d < 16:
@@ -1009,6 +1030,7 @@ def flash_attention_forward(
         BLOCK_N=block_n,
         HEAD_DIM=d,
         IS_CAUSAL=causal,
+        GROUP_SIZE=group_size,
         num_warps=num_warps,
     )
     return (o, lse) if return_lse else o
