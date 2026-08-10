@@ -803,6 +803,7 @@ def _fwd_kernel(
     K,
     V,
     O,
+    L,
     stride_qb,
     stride_qh,
     stride_qm,
@@ -819,6 +820,9 @@ def _fwd_kernel(
     stride_oh,
     stride_om,
     stride_od,
+    stride_lb,
+    stride_lh,
+    stride_lm,
     H,
     N_CTX,
     sm_scale,
@@ -847,6 +851,11 @@ def _fwd_kernel(
     an entirely-masked block would leave m = -inf, making alpha = exp(-inf +
     inf) = NaN. Stopping at the diagonal guarantees every row sees at least its
     own diagonal element, so m is always finite.
+
+    Also writes the log-sum-exp L = m + log(l), one fp32 value per query row.
+    That single number is all the backward pass needs to rebuild any attention
+    probability, since p_ij = exp(s_ij - L_i). Storing P itself would cost
+    O(N^2) per head; L costs O(N).
     """
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -857,6 +866,7 @@ def _fwd_kernel(
     k_base = K + off_b * stride_kb + off_h * stride_kh
     v_base = V + off_b * stride_vb + off_h * stride_vh
     o_base = O + off_b * stride_ob + off_h * stride_oh
+    l_base = L + off_b * stride_lb + off_h * stride_lh
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_DIM)
@@ -906,6 +916,10 @@ def _fwd_kernel(
     o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
     tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=offs_m[:, None] < N_CTX)
 
+    # p_ij = exp(s_ij - L_i) recovers the normalized probabilities directly,
+    # with no division -- which is why m and l are folded into one value.
+    tl.store(l_base + offs_m * stride_lm, m_i + tl.log(l_i), mask=offs_m < N_CTX)
+
 
 def flash_attention_forward(
     q: torch.Tensor,
@@ -913,19 +927,23 @@ def flash_attention_forward(
     v: torch.Tensor,
     causal: bool = False,
     sm_scale: float | None = None,
+    return_lse: bool = False,
     block_m: int | None = None,
     block_n: int | None = None,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """FlashAttention-2 forward pass.
 
     Args:
         q, k, v: (B, H, N, D), same dtype and device. D must be a power of two.
         causal: if True, position i attends only to positions j <= i.
+        return_lse: also return the per-row log-sum-exp, which the backward
+            pass uses to recompute attention probabilities blockwise.
         sm_scale: defaults to 1/sqrt(D).
         block_m, block_n: tile sizes. Default to a heuristic based on D.
 
     Returns:
-        (B, H, N, D) attention output, in the input dtype.
+        (B, H, N, D) attention output in the input dtype, or a tuple of that
+        plus the (B, H, N) fp32 log-sum-exp when `return_lse` is set.
     """
     if not (q.shape == k.shape == v.shape):
         raise ValueError(f"q/k/v must share a shape, got {q.shape}, {k.shape}, {v.shape}")
@@ -959,6 +977,9 @@ def flash_attention_forward(
         sm_scale = 1.0 / math.sqrt(d)
 
     o = torch.empty_like(q)
+    # Always written: a few hundred KB against a multi-MB output is noise, and
+    # it keeps the autograd path from needing a second kernel variant.
+    lse = torch.empty((b, h, n), device=q.device, dtype=torch.float32)
     grid = (triton.cdiv(n, block_m), b * h)
 
     _fwd_kernel[grid](
@@ -966,10 +987,12 @@ def flash_attention_forward(
         k,
         v,
         o,
+        lse,
         *q.stride(),
         *k.stride(),
         *v.stride(),
         *o.stride(),
+        *lse.stride(),
         h,
         n,
         sm_scale,
@@ -979,4 +1002,4 @@ def flash_attention_forward(
         IS_CAUSAL=causal,
         num_warps=num_warps,
     )
-    return o
+    return (o, lse) if return_lse else o
