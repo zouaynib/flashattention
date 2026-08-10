@@ -29,6 +29,38 @@ import math
 import torch
 
 
+def _check_shapes(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool) -> None:
+    if k.shape != v.shape:
+        raise ValueError(f"k/v must share a shape, got {k.shape}, {v.shape}")
+    if q.dim() != 4 or k.dim() != 4:
+        raise ValueError("expected 4D (B, H, N, D) tensors")
+    if q.shape[0] != k.shape[0] or q.shape[1] != k.shape[1] or q.shape[3] != k.shape[3]:
+        raise ValueError(f"q/k/v must share a shape apart from length, got {q.shape}, {k.shape}")
+    if causal and q.shape[2] > k.shape[2]:
+        raise ValueError(
+            f"causal attention needs at least as many keys as queries, got "
+            f"{q.shape[2]} queries and {k.shape[2]} keys: the earliest rows would "
+            f"attend to nothing"
+        )
+
+
+def _causal_mask(q_len: int, kv_len: int, device: torch.device) -> torch.Tensor:
+    """True where a key must be masked out.
+
+    Aligned bottom-right: the q_len queries are the LAST q_len positions of a
+    kv_len-long sequence, so query row m may attend to keys j <= m + (kv_len -
+    q_len). That is the convention KV-cache decoding needs -- with q_len = 1 the
+    single query sees every cached key. Top-left alignment (j <= m) would let a
+    freshly generated token attend to almost nothing.
+
+    When q_len == kv_len the offset is zero and this is the usual triangle.
+    """
+    offset = kv_len - q_len
+    rows = torch.arange(q_len, device=device)[:, None]
+    cols = torch.arange(kv_len, device=device)[None, :]
+    return cols > rows + offset
+
+
 def naive_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -50,10 +82,7 @@ def naive_attention(
     Peak memory is dominated by the (B, H, N, N) score matrix, so this OOMs at
     sequence lengths the tiled kernel handles comfortably.
     """
-    if q.shape != k.shape or q.shape != v.shape:
-        raise ValueError(f"q/k/v must share a shape, got {q.shape}, {k.shape}, {v.shape}")
-    if q.dim() != 4:
-        raise ValueError(f"expected 4D (B, H, N, D) tensors, got {q.dim()}D")
+    _check_shapes(q, k, v, causal)
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -62,12 +91,7 @@ def naive_attention(
     s = (q @ k.transpose(-2, -1)) * sm_scale
 
     if causal:
-        # Mask strictly-upper-triangular entries (j > i) before the softmax, so
-        # they contribute exactly zero weight. Row i always keeps at least the
-        # diagonal entry, so no row is fully masked and m stays finite.
-        n = q.shape[-2]
-        mask = torch.ones(n, n, dtype=torch.bool, device=q.device).triu(diagonal=1)
-        s = s.masked_fill(mask, float("-inf"))
+        s = s.masked_fill(_causal_mask(q.shape[-2], k.shape[-2], q.device), float("-inf"))
 
     # Safe softmax, written out. Subtracting the row max before exponentiating
     # bounds exp() at 1.0; without it, large scores overflow in fp16.
@@ -103,10 +127,7 @@ def standard_attention(
     Returns:
         Output tensor of shape (B, H, N, D).
     """
-    if q.shape != k.shape or q.shape != v.shape:
-        raise ValueError(f"q/k/v must share a shape, got {q.shape}, {k.shape}, {v.shape}")
-    if q.dim() != 4:
-        raise ValueError(f"expected 4D (B, H, N, D) tensors, got {q.dim()}D")
+    _check_shapes(q, k, v, causal)
 
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -114,8 +135,6 @@ def standard_attention(
     s = (q @ k.transpose(-2, -1)) * sm_scale
 
     if causal:
-        n = q.shape[-2]
-        mask = torch.ones(n, n, dtype=torch.bool, device=q.device).triu(diagonal=1)
-        s = s.masked_fill(mask, float("-inf"))
+        s = s.masked_fill(_causal_mask(q.shape[-2], k.shape[-2], q.device), float("-inf"))
 
     return torch.softmax(s, dim=-1) @ v

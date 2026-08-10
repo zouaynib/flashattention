@@ -829,7 +829,8 @@ def _fwd_kernel(
     stride_lh,
     stride_lm,
     H,
-    N_CTX,
+    N_CTX_Q,
+    N_CTX_KV,
     sm_scale,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -848,6 +849,9 @@ def _fwd_kernel(
 
     l >= 1 always -- the row-max term contributes exp(0) = 1 -- so the division
     needs no zero guard.
+
+    Q and K/V may have different lengths, which is what KV-cache decoding
+    needs: N_CTX_Q new queries against N_CTX_KV cached keys.
 
     Causal masking stops the inner loop at the diagonal rather than masking
     every block. K/V blocks strictly above the diagonal are never loaded, so
@@ -885,7 +889,7 @@ def _fwd_kernel(
     offs_d = tl.arange(0, HEAD_DIM)
 
     q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-    q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+    q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX_Q, other=0.0)
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -893,28 +897,33 @@ def _fwd_kernel(
 
     # Causal rows never look past their own index, so the loop stops at the
     # last block containing the diagonal. Everything above it is skipped.
+    # Bottom-right alignment: the N_CTX_Q queries are the LAST N_CTX_Q
+    # positions of an N_CTX_KV-long sequence, so query row m may attend up to
+    # key m + offset. With one query against a full cache, that is every key.
+    causal_offset = N_CTX_KV - N_CTX_Q
+
     if IS_CAUSAL:
-        hi = tl.minimum((start_m + 1) * BLOCK_M, N_CTX)
+        hi = tl.minimum((start_m + 1) * BLOCK_M + causal_offset, N_CTX_KV)
     else:
-        hi = N_CTX
+        hi = N_CTX_KV
 
     for start_n in range(0, hi, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
 
         k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
         v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
-        k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
-        v = tl.load(v_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
+        k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX_KV, other=0.0)
+        v = tl.load(v_ptrs, mask=offs_n[:, None] < N_CTX_KV, other=0.0)
 
         s = tl.dot(q, tl.trans(k)) * sm_scale
-        s = tl.where(offs_n[None, :] < N_CTX, s, float("-inf"))
+        s = tl.where(offs_n[None, :] < N_CTX_KV, s, float("-inf"))
 
         # Only blocks straddling the diagonal actually need this; blocks fully
         # below it are entirely valid. Applying it uniformly is correct but
         # leaves non-matmul work in the hot loop -- splitting the loop into an
         # unmasked range plus a masked diagonal range is a Phase 5 tuning item.
         if IS_CAUSAL:
-            s = tl.where(offs_m[:, None] >= offs_n[None, :], s, float("-inf"))
+            s = tl.where(offs_m[:, None] + causal_offset >= offs_n[None, :], s, float("-inf"))
 
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
         alpha = tl.exp(m_i - m_new)
@@ -927,11 +936,11 @@ def _fwd_kernel(
     acc = acc / l_i[:, None]
 
     o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
-    tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=offs_m[:, None] < N_CTX)
+    tl.store(o_ptrs, acc.to(O.dtype.element_ty), mask=offs_m[:, None] < N_CTX_Q)
 
     # p_ij = exp(s_ij - L_i) recovers the normalized probabilities directly,
     # with no division -- which is why m and l are folded into one value.
-    tl.store(l_base + offs_m * stride_lm, m_i + tl.log(l_i), mask=offs_m < N_CTX)
+    tl.store(l_base + offs_m * stride_lm, m_i + tl.log(l_i), mask=offs_m < N_CTX_Q)
 
 
 def flash_attention_forward(
@@ -947,9 +956,12 @@ def flash_attention_forward(
     """FlashAttention-2 forward pass.
 
     Args:
-        q: (B, H_q, N, D).
-        k, v: (B, H_kv, N, D). H_q must be a multiple of H_kv -- pass H_kv <
-            H_q for grouped-query attention, or H_kv = 1 for multi-query.
+        q: (B, H_q, M, D) -- M queries.
+        k, v: (B, H_kv, N, D) -- N keys. H_q must be a multiple of H_kv (pass
+            H_kv < H_q for grouped-query attention, H_kv = 1 for multi-query).
+            M and N may differ: M < N is KV-cache decoding, where the M queries
+            are the last M positions of an N-long sequence. Causal masking is
+            aligned bottom-right accordingly, and requires M <= N.
         causal: if True, position i attends only to positions j <= i.
         return_lse: also return the per-row log-sum-exp, which the backward
             pass uses to recompute attention probabilities blockwise.
@@ -957,16 +969,24 @@ def flash_attention_forward(
         block_m, block_n: tile sizes. Default to a heuristic based on D.
 
     Returns:
-        (B, H, N, D) attention output in the input dtype, or a tuple of that
-        plus the (B, H, N) fp32 log-sum-exp when `return_lse` is set.
+        (B, H_q, M, D) attention output in the input dtype, or a tuple of that
+        plus the (B, H_q, M) fp32 log-sum-exp when `return_lse` is set.
     """
     if k.shape != v.shape:
         raise ValueError(f"k and v must share a shape, got {k.shape}, {v.shape}")
     if q.dim() != 4 or k.dim() != 4:
         raise ValueError("expected 4D (B, H, N, D) tensors")
-    if q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:]:
+    if q.shape[0] != k.shape[0] or q.shape[3] != k.shape[3]:
         raise ValueError(
-            f"q and k/v may differ only in head count, got {q.shape} and {k.shape}"
+            f"q and k/v may differ only in head count and length, got "
+            f"{q.shape} and {k.shape}"
+        )
+    if causal and q.shape[2] > k.shape[2]:
+        # offset = kv_len - q_len would be negative, so the earliest queries
+        # could attend to nothing: m stays -inf and alpha becomes NaN.
+        raise ValueError(
+            f"causal attention needs at least as many keys as queries, got "
+            f"{q.shape[2]} queries and {k.shape[2]} keys"
         )
     if q.shape[1] % k.shape[1] != 0:
         raise ValueError(
@@ -980,6 +1000,7 @@ def flash_attention_forward(
             f"only fp16 and bf16 are supported (the tensor-core dtypes), got {q.dtype}"
         )
     b, h, n, d = q.shape
+    n_kv = k.shape[2]
     # How many query heads share each K/V head. 1 is ordinary multi-head.
     group_size = h // k.shape[1]
     if d & (d - 1) != 0:
@@ -1025,6 +1046,7 @@ def flash_attention_forward(
         *lse.stride(),
         h,
         n,
+        n_kv,
         sm_scale,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
