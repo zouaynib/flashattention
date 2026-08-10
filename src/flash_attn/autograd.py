@@ -29,15 +29,6 @@ class FlashAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale):
-        # The forward kernel handles differing query/key lengths; the backward
-        # kernels gain it in step 21. Refusing beats returning wrong gradients.
-        if q.shape[2] != k.shape[2]:
-            raise NotImplementedError(
-                "differing query and key lengths are forward-only for now; the "
-                "backward pass gains them in step 21. Use "
-                "flash_attention_forward directly for KV-cache inference."
-            )
-
         # Resolve the default here, once. If backward re-derived it separately,
         # a caller passing an explicit scale to forward would get gradients
         # computed against a different scale -- silently.
@@ -90,8 +81,8 @@ def flash_attention(
     """Differentiable FlashAttention-2, a drop-in for scaled_dot_product_attention.
 
     Args:
-        q: (B, H_q, N, D).
-        k, v: (B, H_kv, N, D). H_q must be a multiple of H_kv; pass H_kv < H_q
+        q: (B, H_q, M, D).
+        k, v: (B, H_kv, N, D). M and N may differ. H_q must be a multiple of H_kv; pass H_kv < H_q
             for grouped-query attention or H_kv = 1 for multi-query. dK and dV
             come back with H_kv heads, matching their inputs.
         causal: if True, position i attends only to positions j <= i.

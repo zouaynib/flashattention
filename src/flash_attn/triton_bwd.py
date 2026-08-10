@@ -65,7 +65,8 @@ def _bwd_dv_kernel(
     stride_dvn,
     stride_dvd,
     H,
-    N_CTX,
+    N_CTX_Q,
+    N_CTX_KV,
     sm_scale,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -84,6 +85,9 @@ def _bwd_dv_kernel(
     off_h = off_hz % H
 
     off_h_kv = off_h // GROUP_SIZE
+    # Bottom-right causal alignment, as in the forward pass: query row m
+    # may attend up to key m + causal_offset.
+    causal_offset = N_CTX_KV - N_CTX_Q
 
     q_base = Q + off_b * stride_qb + off_h * stride_qh
     k_base = K + off_b * stride_kb + off_h_kv * stride_kh
@@ -98,41 +102,43 @@ def _bwd_dv_kernel(
 
     # This block's keys stay resident; Q streams past them.
     k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
-    k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
+    k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX_KV, other=0.0)
 
     dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
 
     # Mirror of the forward's causal bound: query i sees key j only when i >= j,
     # so the earliest query that can see this block is row start_n * BLOCK_N.
     if IS_CAUSAL:
-        lo = (start_n * BLOCK_N // BLOCK_M) * BLOCK_M
+        # Key block start_n is first visible to query row start_n - offset, so
+        # every Q block before that one can be skipped entirely.
+        lo = tl.maximum(((start_n * BLOCK_N - causal_offset) // BLOCK_M) * BLOCK_M, 0)
     else:
         lo = 0
 
-    for start_m in range(lo, N_CTX, BLOCK_M):
+    for start_m in range(lo, N_CTX_Q, BLOCK_M):
         offs_m = start_m + tl.arange(0, BLOCK_M)
 
         q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
         do_ptrs = do_base + offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
-        q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
-        do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+        q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX_Q, other=0.0)
+        do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX_Q, other=0.0)
 
         # Out-of-range rows get L = +inf, so exp(s - L) is exactly 0 and they
         # contribute nothing -- no separate masking of p needed for them.
-        l_i = tl.load(l_base + offs_m * stride_lm, mask=offs_m < N_CTX, other=float("inf"))
+        l_i = tl.load(l_base + offs_m * stride_lm, mask=offs_m < N_CTX_Q, other=float("inf"))
 
         # Recomputation: rebuild this block of P from Q, K and L.
         s = tl.dot(q, tl.trans(k)) * sm_scale
         p = tl.exp(s - l_i[:, None])
 
         if IS_CAUSAL:
-            p = tl.where(offs_m[:, None] >= offs_n[None, :], p, 0.0)
+            p = tl.where(offs_m[:, None] + causal_offset >= offs_n[None, :], p, 0.0)
 
         # (BLOCK_N, BLOCK_M) @ (BLOCK_M, HEAD_DIM) -> (BLOCK_N, HEAD_DIM)
         dv += tl.dot(tl.trans(p).to(do.dtype), do)
 
     dv_ptrs = dv_base + offs_n[:, None] * stride_dvn + offs_d[None, :] * stride_dvd
-    tl.store(dv_ptrs, dv.to(DV.dtype.element_ty), mask=offs_n[:, None] < N_CTX)
+    tl.store(dv_ptrs, dv.to(DV.dtype.element_ty), mask=offs_n[:, None] < N_CTX_KV)
 
 
 def backward_dv(
@@ -161,11 +167,18 @@ def backward_dv(
     """
     if q.shape != do.shape:
         raise ValueError(f"q and do must share a shape, got {q.shape}, {do.shape}")
-    if q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:]:
-        raise ValueError(f"q and k may differ only in head count, got {q.shape}, {k.shape}")
+    if q.shape[0] != k.shape[0] or q.shape[3] != k.shape[3]:
+        raise ValueError(
+            f"q and k may differ only in head count and length, got {q.shape}, {k.shape}"
+        )
     if q.shape[1] % k.shape[1] != 0:
         raise ValueError(
             f"query heads must be a multiple of kv heads, got {q.shape[1]} and {k.shape[1]}"
+        )
+    if causal and q.shape[2] > k.shape[2]:
+        raise ValueError(
+            f"causal attention needs at least as many keys as queries, got "
+            f"{q.shape[2]} queries and {k.shape[2]} keys"
         )
     if do.dtype not in SUPPORTED_DTYPES:
         raise ValueError(f"only fp16 and bf16 are supported, got {do.dtype}")
@@ -182,7 +195,7 @@ def backward_dv(
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(d)
 
-    dv, group_shape = _grouped_output(q, do, group_size)
+    dv, group_shape = _grouped_output(q, k, do, group_size)
 
     # Parallel over K/V blocks -- the transpose of the forward grid. Under GQA
     # there is one program per QUERY head, so each writes its own slot.
@@ -201,6 +214,7 @@ def backward_dv(
         *dv.stride(),
         h,
         n,
+        k.shape[2],
         sm_scale,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
@@ -230,7 +244,7 @@ def _bwd_preprocess_kernel(
     stride_dh,
     stride_dm,
     H,
-    N_CTX,
+    N_CTX_Q,
     BLOCK_M: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
@@ -263,10 +277,10 @@ def _bwd_preprocess_kernel(
     o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
     do_ptrs = do_base + offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
 
-    o = tl.load(o_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0).to(tl.float32)
-    do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0).to(tl.float32)
+    o = tl.load(o_ptrs, mask=offs_m[:, None] < N_CTX_Q, other=0.0).to(tl.float32)
+    do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX_Q, other=0.0).to(tl.float32)
 
-    tl.store(d_base + offs_m * stride_dm, tl.sum(o * do, axis=1), mask=offs_m < N_CTX)
+    tl.store(d_base + offs_m * stride_dm, tl.sum(o * do, axis=1), mask=offs_m < N_CTX_Q)
 
 
 @triton.jit
@@ -302,7 +316,8 @@ def _bwd_dk_kernel(
     stride_dkn,
     stride_dkd,
     H,
-    N_CTX,
+    N_CTX_Q,
+    N_CTX_KV,
     sm_scale,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -321,6 +336,9 @@ def _bwd_dk_kernel(
     off_h = off_hz % H
 
     off_h_kv = off_h // GROUP_SIZE
+    # Bottom-right causal alignment, as in the forward pass: query row m
+    # may attend up to key m + causal_offset.
+    causal_offset = N_CTX_KV - N_CTX_Q
 
     q_base = Q + off_b * stride_qb + off_h * stride_qh
     k_base = K + off_b * stride_kb + off_h_kv * stride_kh
@@ -335,31 +353,33 @@ def _bwd_dk_kernel(
 
     k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
     v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
-    k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
-    v = tl.load(v_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
+    k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX_KV, other=0.0)
+    v = tl.load(v_ptrs, mask=offs_n[:, None] < N_CTX_KV, other=0.0)
 
     dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
 
     if IS_CAUSAL:
-        lo = (start_n * BLOCK_N // BLOCK_M) * BLOCK_M
+        # Key block start_n is first visible to query row start_n - offset, so
+        # every Q block before that one can be skipped entirely.
+        lo = tl.maximum(((start_n * BLOCK_N - causal_offset) // BLOCK_M) * BLOCK_M, 0)
     else:
         lo = 0
 
-    for start_m in range(lo, N_CTX, BLOCK_M):
+    for start_m in range(lo, N_CTX_Q, BLOCK_M):
         offs_m = start_m + tl.arange(0, BLOCK_M)
 
         q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
         do_ptrs = do_base + offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
-        q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
-        do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+        q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX_Q, other=0.0)
+        do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX_Q, other=0.0)
 
-        l_i = tl.load(l_base + offs_m * stride_lm, mask=offs_m < N_CTX, other=float("inf"))
-        delta_i = tl.load(d_base + offs_m * stride_lm, mask=offs_m < N_CTX, other=0.0)
+        l_i = tl.load(l_base + offs_m * stride_lm, mask=offs_m < N_CTX_Q, other=float("inf"))
+        delta_i = tl.load(d_base + offs_m * stride_lm, mask=offs_m < N_CTX_Q, other=0.0)
 
         s = tl.dot(q, tl.trans(k)) * sm_scale
         p = tl.exp(s - l_i[:, None])
         if IS_CAUSAL:
-            p = tl.where(offs_m[:, None] >= offs_n[None, :], p, 0.0)
+            p = tl.where(offs_m[:, None] + causal_offset >= offs_n[None, :], p, 0.0)
 
         # dP = dO V^T, then the softmax Jacobian. Kept in fp32: the subtraction
         # cancels when dP is close to D, which amplifies relative error.
@@ -370,7 +390,7 @@ def _bwd_dk_kernel(
 
     dk = dk * sm_scale
     dk_ptrs = dk_base + offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
-    tl.store(dk_ptrs, dk.to(DK.dtype.element_ty), mask=offs_n[:, None] < N_CTX)
+    tl.store(dk_ptrs, dk.to(DK.dtype.element_ty), mask=offs_n[:, None] < N_CTX_KV)
 
 
 @triton.jit
@@ -406,7 +426,8 @@ def _bwd_dq_kernel(
     stride_dqm,
     stride_dqd,
     H,
-    N_CTX,
+    N_CTX_Q,
+    N_CTX_KV,
     sm_scale,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -426,6 +447,9 @@ def _bwd_dq_kernel(
     off_h = off_hz % H
 
     off_h_kv = off_h // GROUP_SIZE
+    # Bottom-right causal alignment, as in the forward pass: query row m
+    # may attend up to key m + causal_offset.
+    causal_offset = N_CTX_KV - N_CTX_Q
 
     q_base = Q + off_b * stride_qb + off_h * stride_qh
     k_base = K + off_b * stride_kb + off_h_kv * stride_kh
@@ -440,32 +464,32 @@ def _bwd_dq_kernel(
 
     q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
     do_ptrs = do_base + offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
-    q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
-    do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX, other=0.0)
+    q = tl.load(q_ptrs, mask=offs_m[:, None] < N_CTX_Q, other=0.0)
+    do = tl.load(do_ptrs, mask=offs_m[:, None] < N_CTX_Q, other=0.0)
 
-    l_i = tl.load(l_base + offs_m * stride_lm, mask=offs_m < N_CTX, other=float("inf"))
-    delta_i = tl.load(d_base + offs_m * stride_lm, mask=offs_m < N_CTX, other=0.0)
+    l_i = tl.load(l_base + offs_m * stride_lm, mask=offs_m < N_CTX_Q, other=float("inf"))
+    delta_i = tl.load(d_base + offs_m * stride_lm, mask=offs_m < N_CTX_Q, other=0.0)
 
     dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
     if IS_CAUSAL:
-        hi = tl.minimum((start_m + 1) * BLOCK_M, N_CTX)
+        hi = tl.minimum((start_m + 1) * BLOCK_M + causal_offset, N_CTX_KV)
     else:
-        hi = N_CTX
+        hi = N_CTX_KV
 
     for start_n in range(0, hi, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
 
         k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
         v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
-        k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
-        v = tl.load(v_ptrs, mask=offs_n[:, None] < N_CTX, other=0.0)
+        k = tl.load(k_ptrs, mask=offs_n[:, None] < N_CTX_KV, other=0.0)
+        v = tl.load(v_ptrs, mask=offs_n[:, None] < N_CTX_KV, other=0.0)
 
         s = tl.dot(q, tl.trans(k)) * sm_scale
         p = tl.exp(s - l_i[:, None])
-        p = tl.where(offs_n[None, :] < N_CTX, p, 0.0)
+        p = tl.where(offs_n[None, :] < N_CTX_KV, p, 0.0)
         if IS_CAUSAL:
-            p = tl.where(offs_m[:, None] >= offs_n[None, :], p, 0.0)
+            p = tl.where(offs_m[:, None] + causal_offset >= offs_n[None, :], p, 0.0)
 
         dp = tl.dot(do, tl.trans(v))
         ds = p * (dp - delta_i[:, None])
@@ -474,7 +498,7 @@ def _bwd_dq_kernel(
 
     dq = dq * sm_scale
     dq_ptrs = dq_base + offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
-    tl.store(dq_ptrs, dq.to(DQ.dtype.element_ty), mask=offs_m[:, None] < N_CTX)
+    tl.store(dq_ptrs, dq.to(DQ.dtype.element_ty), mask=offs_m[:, None] < N_CTX_Q)
 
 
 def backward_preprocess(o: torch.Tensor, do: torch.Tensor, block_m: int = 64) -> torch.Tensor:
@@ -505,7 +529,7 @@ def backward_preprocess(o: torch.Tensor, do: torch.Tensor, block_m: int = 64) ->
     return delta
 
 
-def _grouped_output(q, do, group_size):
+def _grouped_output(q, k, do, group_size):
     """Buffer the dK/dV kernels write into, plus how to collapse it.
 
     With GROUP_SIZE query heads sharing a K/V head, each query head produces a
@@ -518,16 +542,19 @@ def _grouped_output(q, do, group_size):
     Group size 1 takes the original path exactly: same dtype, same buffer, no
     reduction, so ordinary multi-head attention is untouched.
     """
+    b, h_q, _, d = q.shape
+    n_kv = k.shape[2]
+    # Shaped like K/V, NOT like dO: with differing query and key lengths those
+    # are no longer the same tensor shape.
     if group_size == 1:
-        return torch.empty_like(do), None
-    b, h_q, n, d = q.shape
+        return torch.empty((b, h_q, n_kv, d), device=q.device, dtype=do.dtype), None
     # fp32 scratch: summing up to GROUP_SIZE partials in fp16 would lose
     # precision the rest of the backward pass carefully preserves.
-    return torch.empty((b, h_q, n, d), device=q.device, dtype=torch.float32), (
+    return torch.empty((b, h_q, n_kv, d), device=q.device, dtype=torch.float32), (
         b,
         h_q // group_size,
         group_size,
-        n,
+        n_kv,
         d,
     )
 
@@ -538,16 +565,23 @@ def _collapse_groups(buf, shape, dtype):
     return buf.view(*shape).sum(dim=2).to(dtype)
 
 
-def _check_backward_inputs(q, k, v, do, lse, delta, block_m, block_n):
+def _check_backward_inputs(q, k, v, do, lse, delta, block_m, block_n, causal):
     if k.shape != v.shape:
         raise ValueError(f"k and v must share a shape, got {k.shape}, {v.shape}")
     if q.shape != do.shape:
         raise ValueError(f"q and do must share a shape, got {q.shape}, {do.shape}")
-    if q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:]:
-        raise ValueError(f"q and k/v may differ only in head count, got {q.shape}, {k.shape}")
+    if q.shape[0] != k.shape[0] or q.shape[3] != k.shape[3]:
+        raise ValueError(
+            f"q and k/v may differ only in head count and length, got {q.shape}, {k.shape}"
+        )
     if q.shape[1] % k.shape[1] != 0:
         raise ValueError(
             f"query heads must be a multiple of kv heads, got {q.shape[1]} and {k.shape[1]}"
+        )
+    if causal and q.shape[2] > k.shape[2]:
+        raise ValueError(
+            f"causal attention needs at least as many keys as queries, got "
+            f"{q.shape[2]} queries and {k.shape[2]} keys"
         )
     if do.dtype not in SUPPORTED_DTYPES:
         raise ValueError(f"only fp16 and bf16 are supported, got {do.dtype}")
@@ -579,12 +613,12 @@ def backward_dk(
     block_n: int = 64,
 ) -> torch.Tensor:
     """Gradient with respect to K. Returns (B, H, N, D) in the dtype of `do`."""
-    b, h, n, d = _check_backward_inputs(q, k, v, do, lse, delta, block_m, block_n)
+    b, h, n, d = _check_backward_inputs(q, k, v, do, lse, delta, block_m, block_n, causal)
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(d)
 
     group_size = h // k.shape[1]
-    dk, group_shape = _grouped_output(q, do, group_size)
+    dk, group_shape = _grouped_output(q, k, do, group_size)
     grid = (triton.cdiv(n, block_n), b * h)
 
     _bwd_dk_kernel[grid](
@@ -603,6 +637,7 @@ def backward_dk(
         *dk.stride(),
         h,
         n,
+        k.shape[2],
         sm_scale,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
@@ -628,7 +663,7 @@ def backward_dq(
     block_n: int = 64,
 ) -> torch.Tensor:
     """Gradient with respect to Q. Returns (B, H, N, D) in the dtype of `do`."""
-    b, h, n, d = _check_backward_inputs(q, k, v, do, lse, delta, block_m, block_n)
+    b, h, n, d = _check_backward_inputs(q, k, v, do, lse, delta, block_m, block_n, causal)
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(d)
 
@@ -652,6 +687,7 @@ def backward_dq(
         *dq.stride(),
         h,
         n,
+        k.shape[2],
         sm_scale,
         BLOCK_M=block_m,
         BLOCK_N=block_n,

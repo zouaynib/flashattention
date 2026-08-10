@@ -171,8 +171,13 @@ def test_more_queries_than_keys_is_fine_without_causal():
     torch.testing.assert_close(got.float(), want, atol=ATOL, rtol=RTOL)
 
 
-def test_autograd_rejects_varlen_for_now():
+def test_autograd_accepts_varlen():
+    """Supported end to end as of step 21; gradients keep their input shapes."""
     q = torch.randn(1, 1, 8, 64, device="cuda", dtype=torch.float16, requires_grad=True)
     k = torch.randn(1, 1, 64, 64, device="cuda", dtype=torch.float16, requires_grad=True)
-    with pytest.raises(NotImplementedError, match="step 21"):
-        flash_attention(q, k, k)
+    v = torch.randn(1, 1, 64, 64, device="cuda", dtype=torch.float16, requires_grad=True)
+
+    flash_attention(q, k, v, causal=True).sum().backward()
+
+    assert q.grad.shape == q.shape
+    assert k.grad.shape == k.shape and v.grad.shape == v.shape
