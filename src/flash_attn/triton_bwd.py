@@ -35,6 +35,8 @@ import torch
 import triton
 import triton.language as tl
 
+from flash_attn.triton_fwd import SUPPORTED_DTYPES
+
 
 @triton.jit
 def _bwd_dv_kernel(
@@ -154,6 +156,8 @@ def backward_dv(
     """
     if not (q.shape == k.shape == do.shape):
         raise ValueError(f"q/k/do must share a shape, got {q.shape}, {k.shape}, {do.shape}")
+    if do.dtype not in SUPPORTED_DTYPES:
+        raise ValueError(f"only fp16 and bf16 are supported, got {do.dtype}")
     b, h, n, d = q.shape
     if lse.shape != (b, h, n):
         raise ValueError(f"lse must be (B, H, N) = {(b, h, n)}, got {tuple(lse.shape)}")
@@ -484,6 +488,8 @@ def backward_preprocess(o: torch.Tensor, do: torch.Tensor, block_m: int = 64) ->
 def _check_backward_inputs(q, k, v, do, lse, delta, block_m, block_n):
     if not (q.shape == k.shape == v.shape == do.shape):
         raise ValueError("q/k/v/do must share a shape")
+    if do.dtype not in SUPPORTED_DTYPES:
+        raise ValueError(f"only fp16 and bf16 are supported, got {do.dtype}")
     b, h, n, d = q.shape
     if lse.shape != (b, h, n) or delta.shape != (b, h, n):
         raise ValueError(f"lse and delta must be (B, H, N) = {(b, h, n)}")

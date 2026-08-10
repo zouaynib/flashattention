@@ -41,6 +41,11 @@ import torch
 import triton
 import triton.language as tl
 
+# tl.dot reaches tensor cores only for these. fp32 would fall back to a much
+# slower path and fp64 is unsupported outright, so the contract is explicit
+# rather than failing somewhere deep inside Triton.
+SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+
 
 @triton.jit
 def _copy_q_kernel(
@@ -949,6 +954,10 @@ def flash_attention_forward(
         raise ValueError(f"q/k/v must share a shape, got {q.shape}, {k.shape}, {v.shape}")
     if not (q.dtype == k.dtype == v.dtype):
         raise ValueError(f"q/k/v must share a dtype, got {q.dtype}, {k.dtype}, {v.dtype}")
+    if q.dtype not in SUPPORTED_DTYPES:
+        raise ValueError(
+            f"only fp16 and bf16 are supported (the tensor-core dtypes), got {q.dtype}"
+        )
     if q.dim() != 4:
         raise ValueError(f"expected 4D (B, H, N, D) tensors, got {q.dim()}D")
     b, h, n, d = q.shape
@@ -1003,3 +1012,4 @@ def flash_attention_forward(
         num_warps=num_warps,
     )
     return (o, lse) if return_lse else o
+ 
