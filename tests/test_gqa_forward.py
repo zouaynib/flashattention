@@ -134,11 +134,18 @@ def test_rejects_non_divisible_head_counts(h_q, h_kv):
         flash_attention_forward(q, k, k)
 
 
-def test_rejects_mismatched_sequence_or_dim():
+def test_rejects_mismatched_batch_or_head_dim():
+    """Head count may differ (GQA, step 18) and so may sequence length (step
+    20). Batch and head_dim may not -- those are genuine shape errors."""
     q = torch.randn(1, 8, 64, 64, device="cuda", dtype=torch.float16)
-    k = torch.randn(1, 4, 32, 64, device="cuda", dtype=torch.float16)
-    with pytest.raises(ValueError, match="may differ only in head count"):
-        flash_attention_forward(q, k, k)
+
+    wrong_head_dim = torch.randn(1, 4, 64, 32, device="cuda", dtype=torch.float16)
+    with pytest.raises(ValueError, match="may differ only in head count and length"):
+        flash_attention_forward(q, wrong_head_dim, wrong_head_dim)
+
+    wrong_batch = torch.randn(2, 4, 64, 64, device="cuda", dtype=torch.float16)
+    with pytest.raises(ValueError, match="may differ only in head count and length"):
+        flash_attention_forward(q, wrong_batch, wrong_batch)
 
 
 def test_autograd_accepts_gqa():
