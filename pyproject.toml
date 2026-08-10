@@ -17,6 +17,8 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = ["--durations=12"]
 markers = [
     "gpu: requires a CUDA device and Triton (skipped automatically on CPU-only machines)",
+    "slow: long-context or large fp32-reference cases; run everything by default, use -m 'not slow' to skip",
 ]

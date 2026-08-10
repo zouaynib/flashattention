@@ -33,7 +33,7 @@ def _reference_stats(q, k, sm_scale):
     [
         (1, 1, 64, 64),  # single block: alpha is never exercised
         (2, 4, 256, 64),  # four blocks
-        (1, 2, 1024, 64),  # many blocks, more chances to rescale
+        pytest.param(1, 2, 1024, 64, marks=pytest.mark.slow),  # many blocks, more chances to rescale
         (1, 1, 100, 32),  # partial last block
         (2, 2, 17, 16),  # N smaller than one block
     ],

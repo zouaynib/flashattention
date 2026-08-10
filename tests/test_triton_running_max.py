@@ -30,7 +30,7 @@ def _reference_max(q, k, sm_scale):
     [
         (1, 1, 64, 64),  # exactly one K block
         (2, 4, 256, 64),  # four K blocks
-        (1, 2, 1024, 64),  # many blocks
+        pytest.param(1, 2, 1024, 64, marks=pytest.mark.slow),  # many blocks
         (1, 1, 100, 32),  # N not a multiple of BLOCK_N -> partial last block
         (2, 2, 17, 16),  # N smaller than one block
     ],

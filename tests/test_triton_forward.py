@@ -28,7 +28,7 @@ RTOL = 1e-2
     [
         (1, 1, 64, 64),
         (2, 4, 256, 64),
-        (1, 2, 1024, 64),
+        pytest.param(1, 2, 1024, 64, marks=pytest.mark.slow),
         (4, 8, 512, 32),
         (1, 1, 100, 32),  # partial last Q block
         (2, 2, 17, 16),  # N smaller than one block
@@ -58,6 +58,7 @@ def test_matches_pytorch_sdpa(b, h, n, d):
     torch.testing.assert_close(got.float(), want.float(), atol=ATOL, rtol=RTOL)
 
 
+@pytest.mark.slow
 def test_long_sequence():
     """4096 tokens: the regime the project is actually about.
 

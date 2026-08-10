@@ -25,3 +25,20 @@ pytest
 
 Tests marked `gpu` require CUDA and Triton, and are skipped automatically on a
 CPU-only machine. Everything else runs anywhere.
+
+`pytest` runs the whole suite. For a faster pass while iterating, skip the
+long-context and large fp32-reference cases:
+
+```bash
+pytest -m "not slow"
+```
+
+Every run prints its twelve slowest tests, so it stays obvious what the suite
+is spending its time on.
+
+### Why there is no `gradcheck`
+
+`torch.autograd.gradcheck` is the usual way to validate a custom
+`autograd.Function`, but it requires float64 and `tl.dot` only reaches tensor
+cores in fp16/bf16. The gradients are instead checked against autograd through
+the fp32 naive baseline, which is itself verified against PyTorch's SDPA.

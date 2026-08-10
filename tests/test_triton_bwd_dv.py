@@ -34,7 +34,7 @@ def _reference_dv(q, k, v, do, causal):
     [
         (1, 1, 64, 64),
         (2, 4, 256, 64),
-        (1, 2, 1024, 64),
+        pytest.param(1, 2, 1024, 64, marks=pytest.mark.slow),
         (1, 1, 100, 32),  # partial blocks in both loops
         (2, 2, 17, 16),
         (1, 2, 384, 128),

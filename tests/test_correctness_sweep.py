@@ -91,6 +91,7 @@ def test_backward_sweep(b, h, n, d, dtype, causal):
         )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_long_context(dtype):
     """2048 tokens -- the regime the project is about.
