@@ -199,7 +199,9 @@ def backward_dv(
 
     # Parallel over K/V blocks -- the transpose of the forward grid. Under GQA
     # there is one program per QUERY head, so each writes its own slot.
-    grid = (triton.cdiv(n, block_n), b * h)
+    # The grid spans the KEY length: with M != N, sizing it from the query
+    # length would leave later key blocks unwritten (and uninitialized).
+    grid = (triton.cdiv(k.shape[2], block_n), b * h)
 
     _bwd_dv_kernel[grid](
         q,
@@ -619,7 +621,8 @@ def backward_dk(
 
     group_size = h // k.shape[1]
     dk, group_shape = _grouped_output(q, k, do, group_size)
-    grid = (triton.cdiv(n, block_n), b * h)
+    # Spans the KEY length, as in backward_dv.
+    grid = (triton.cdiv(k.shape[2], block_n), b * h)
 
     _bwd_dk_kernel[grid](
         q,
