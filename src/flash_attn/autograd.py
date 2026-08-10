@@ -29,16 +29,6 @@ class FlashAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, k, v, causal, sm_scale):
-        # The forward kernel handles grouped-query attention, but the backward
-        # kernels do not yet. Refusing here is better than returning gradients
-        # of the wrong shape or, worse, quietly wrong values.
-        if q.shape[1] != k.shape[1]:
-            raise NotImplementedError(
-                "grouped-query attention is forward-only for now; the backward "
-                "pass gains it in step 19. Use flash_attention_forward directly "
-                "for inference."
-            )
-
         # Resolve the default here, once. If backward re-derived it separately,
         # a caller passing an explicit scale to forward would get gradients
         # computed against a different scale -- silently.
@@ -91,8 +81,10 @@ def flash_attention(
     """Differentiable FlashAttention-2, a drop-in for scaled_dot_product_attention.
 
     Args:
-        q, k, v: (B, H, N, D) tensors sharing dtype and device. D must be a
-            power of two and at least 16.
+        q: (B, H_q, N, D).
+        k, v: (B, H_kv, N, D). H_q must be a multiple of H_kv; pass H_kv < H_q
+            for grouped-query attention or H_kv = 1 for multi-query. dK and dV
+            come back with H_kv heads, matching their inputs.
         causal: if True, position i attends only to positions j <= i.
         sm_scale: softmax temperature, defaulting to 1/sqrt(D).
 

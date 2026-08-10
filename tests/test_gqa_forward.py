@@ -141,13 +141,17 @@ def test_rejects_mismatched_sequence_or_dim():
         flash_attention_forward(q, k, k)
 
 
-def test_autograd_rejects_gqa_for_now():
-    """Backward gains GQA in step 19. Until then it must refuse rather than
-    return gradients of the wrong shape."""
+def test_autograd_accepts_gqa():
+    """GQA works end to end through autograd as of step 19, and dK/dV come back
+    shaped like their inputs rather than expanded to H_q."""
     q = torch.randn(1, 8, 64, 64, device="cuda", dtype=torch.float16, requires_grad=True)
     k = torch.randn(1, 4, 64, 64, device="cuda", dtype=torch.float16, requires_grad=True)
-    with pytest.raises(NotImplementedError, match="step 19"):
-        flash_attention(q, k, k)
+    v = torch.randn(1, 4, 64, 64, device="cuda", dtype=torch.float16, requires_grad=True)
+
+    flash_attention(q, k, v, causal=True).sum().backward()
+
+    assert q.grad.shape == q.shape
+    assert k.grad.shape == k.shape and v.grad.shape == v.shape
 
 
 def test_mha_path_is_unchanged():

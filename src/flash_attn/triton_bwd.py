@@ -71,6 +71,7 @@ def _bwd_dv_kernel(
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
 ):
     """dV = P^T dO, accumulated over every Q block.
 
@@ -82,10 +83,14 @@ def _bwd_dv_kernel(
     off_b = off_hz // H
     off_h = off_hz % H
 
+    off_h_kv = off_h // GROUP_SIZE
+
     q_base = Q + off_b * stride_qb + off_h * stride_qh
-    k_base = K + off_b * stride_kb + off_h * stride_kh
+    k_base = K + off_b * stride_kb + off_h_kv * stride_kh
     do_base = DO + off_b * stride_dob + off_h * stride_doh
     l_base = LSE + off_b * stride_lb + off_h * stride_lh
+    # Written per QUERY head. Contributions from the heads sharing a K/V head
+    # are summed afterwards, outside the kernel.
     dv_base = DV + off_b * stride_dvb + off_h * stride_dvh
 
     offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -154,11 +159,18 @@ def backward_dv(
 
     V itself is not needed: dV = P^T dO depends only on the probabilities.
     """
-    if not (q.shape == k.shape == do.shape):
-        raise ValueError(f"q/k/do must share a shape, got {q.shape}, {k.shape}, {do.shape}")
+    if q.shape != do.shape:
+        raise ValueError(f"q and do must share a shape, got {q.shape}, {do.shape}")
+    if q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:]:
+        raise ValueError(f"q and k may differ only in head count, got {q.shape}, {k.shape}")
+    if q.shape[1] % k.shape[1] != 0:
+        raise ValueError(
+            f"query heads must be a multiple of kv heads, got {q.shape[1]} and {k.shape[1]}"
+        )
     if do.dtype not in SUPPORTED_DTYPES:
         raise ValueError(f"only fp16 and bf16 are supported, got {do.dtype}")
     b, h, n, d = q.shape
+    group_size = h // k.shape[1]
     if lse.shape != (b, h, n):
         raise ValueError(f"lse must be (B, H, N) = {(b, h, n)}, got {tuple(lse.shape)}")
     for name, value in (("block_m", block_m), ("block_n", block_n), ("head_dim", d)):
@@ -170,9 +182,10 @@ def backward_dv(
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(d)
 
-    dv = torch.empty_like(do)
+    dv, group_shape = _grouped_output(q, do, group_size)
 
-    # Parallel over K/V blocks -- the transpose of the forward grid.
+    # Parallel over K/V blocks -- the transpose of the forward grid. Under GQA
+    # there is one program per QUERY head, so each writes its own slot.
     grid = (triton.cdiv(n, block_n), b * h)
 
     _bwd_dv_kernel[grid](
@@ -193,10 +206,11 @@ def backward_dv(
         BLOCK_N=block_n,
         HEAD_DIM=d,
         IS_CAUSAL=causal,
+        GROUP_SIZE=group_size,
         num_warps=8 if d >= 128 else 4,
         num_stages=2 if d >= 128 else 3,
     )
-    return dv
+    return _collapse_groups(dv, group_shape, do.dtype)
 
 
 @triton.jit
@@ -294,6 +308,7 @@ def _bwd_dk_kernel(
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
 ):
     """dK = sm_scale * dS^T Q, with dS = P * (dP - D).
 
@@ -305,9 +320,11 @@ def _bwd_dk_kernel(
     off_b = off_hz // H
     off_h = off_hz % H
 
+    off_h_kv = off_h // GROUP_SIZE
+
     q_base = Q + off_b * stride_qb + off_h * stride_qh
-    k_base = K + off_b * stride_kb + off_h * stride_kh
-    v_base = V + off_b * stride_vb + off_h * stride_vh
+    k_base = K + off_b * stride_kb + off_h_kv * stride_kh
+    v_base = V + off_b * stride_vb + off_h_kv * stride_vh
     do_base = DO + off_b * stride_dob + off_h * stride_doh
     l_base = LSE + off_b * stride_lb + off_h * stride_lh
     d_base = DELTA + off_b * stride_lb + off_h * stride_lh
@@ -395,6 +412,7 @@ def _bwd_dq_kernel(
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
 ):
     """dQ = sm_scale * dS K, with dS = P * (dP - D).
 
@@ -407,9 +425,11 @@ def _bwd_dq_kernel(
     off_b = off_hz // H
     off_h = off_hz % H
 
+    off_h_kv = off_h // GROUP_SIZE
+
     q_base = Q + off_b * stride_qb + off_h * stride_qh
-    k_base = K + off_b * stride_kb + off_h * stride_kh
-    v_base = V + off_b * stride_vb + off_h * stride_vh
+    k_base = K + off_b * stride_kb + off_h_kv * stride_kh
+    v_base = V + off_b * stride_vb + off_h_kv * stride_vh
     do_base = DO + off_b * stride_dob + off_h * stride_doh
     l_base = LSE + off_b * stride_lb + off_h * stride_lh
     d_base = DELTA + off_b * stride_lb + off_h * stride_lh
@@ -485,9 +505,50 @@ def backward_preprocess(o: torch.Tensor, do: torch.Tensor, block_m: int = 64) ->
     return delta
 
 
+def _grouped_output(q, do, group_size):
+    """Buffer the dK/dV kernels write into, plus how to collapse it.
+
+    With GROUP_SIZE query heads sharing a K/V head, each query head produces a
+    partial gradient for that head. One program per query head writes its own
+    slot and the slots are summed afterwards. The scratch buffer is (B, H_q, N,
+    D) -- the size of Q, linear in N -- so it does not reintroduce quadratic
+    memory. A production kernel accumulates in-register instead, at the cost of
+    a nested loop that unrolls badly at large group sizes.
+
+    Group size 1 takes the original path exactly: same dtype, same buffer, no
+    reduction, so ordinary multi-head attention is untouched.
+    """
+    if group_size == 1:
+        return torch.empty_like(do), None
+    b, h_q, n, d = q.shape
+    # fp32 scratch: summing up to GROUP_SIZE partials in fp16 would lose
+    # precision the rest of the backward pass carefully preserves.
+    return torch.empty((b, h_q, n, d), device=q.device, dtype=torch.float32), (
+        b,
+        h_q // group_size,
+        group_size,
+        n,
+        d,
+    )
+
+
+def _collapse_groups(buf, shape, dtype):
+    if shape is None:
+        return buf
+    return buf.view(*shape).sum(dim=2).to(dtype)
+
+
 def _check_backward_inputs(q, k, v, do, lse, delta, block_m, block_n):
-    if not (q.shape == k.shape == v.shape == do.shape):
-        raise ValueError("q/k/v/do must share a shape")
+    if k.shape != v.shape:
+        raise ValueError(f"k and v must share a shape, got {k.shape}, {v.shape}")
+    if q.shape != do.shape:
+        raise ValueError(f"q and do must share a shape, got {q.shape}, {do.shape}")
+    if q.shape[0] != k.shape[0] or q.shape[2:] != k.shape[2:]:
+        raise ValueError(f"q and k/v may differ only in head count, got {q.shape}, {k.shape}")
+    if q.shape[1] % k.shape[1] != 0:
+        raise ValueError(
+            f"query heads must be a multiple of kv heads, got {q.shape[1]} and {k.shape[1]}"
+        )
     if do.dtype not in SUPPORTED_DTYPES:
         raise ValueError(f"only fp16 and bf16 are supported, got {do.dtype}")
     b, h, n, d = q.shape
@@ -522,7 +583,8 @@ def backward_dk(
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(d)
 
-    dk = torch.empty_like(do)
+    group_size = h // k.shape[1]
+    dk, group_shape = _grouped_output(q, do, group_size)
     grid = (triton.cdiv(n, block_n), b * h)
 
     _bwd_dk_kernel[grid](
@@ -546,10 +608,11 @@ def backward_dk(
         BLOCK_N=block_n,
         HEAD_DIM=d,
         IS_CAUSAL=causal,
+        GROUP_SIZE=group_size,
         num_warps=8 if d >= 128 else 4,
         num_stages=2 if d >= 128 else 3,
     )
-    return dk
+    return _collapse_groups(dk, group_shape, do.dtype)
 
 
 def backward_dq(
@@ -569,6 +632,7 @@ def backward_dq(
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(d)
 
+    group_size = h // k.shape[1]
     dq = torch.empty_like(do)
     grid = (triton.cdiv(n, block_m), b * h)
 
@@ -593,6 +657,7 @@ def backward_dq(
         BLOCK_N=block_n,
         HEAD_DIM=d,
         IS_CAUSAL=causal,
+        GROUP_SIZE=group_size,
         num_warps=8 if d >= 128 else 4,
         num_stages=2 if d >= 128 else 3,
     )
