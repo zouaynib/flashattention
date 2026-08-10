@@ -6,8 +6,7 @@ venv/
 .pytest_cache/
 .ipynb_checkpoints/
 
-# Benchmark artifacts: plots are committed, raw runs are regenerated
-benchmarks/results/*.json
-benchmarks/results/*.csv
+# Raw benchmark data IS committed -- the measurements are a deliverable, and
+# they cannot be reproduced without the same GPU.
 
 .DS_Store
