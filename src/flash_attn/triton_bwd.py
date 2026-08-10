@@ -19,6 +19,13 @@ parallelizes over Q blocks with K/V streaming inside; dV accumulates into a
 fixed K/V block across all Q blocks, so backward parallelizes over K/V blocks
 with Q streaming inside.
 
+A note on `num_stages`. Triton pipelines the inner loop by prefetching several
+copies of the streamed tiles. At HEAD_DIM=128 each K or V tile is 16 KB, so the
+default three stages of both is already 98 KB -- and these kernels also hold q,
+do and an fp32 accumulator live. That overruns sm_86's ~100 KB of shared memory
+per SM, so large head dims drop to two stages. Cards with more shared memory
+(A100 164 KB, H100 228 KB) would not need this.
+
 Importing this module requires Triton, which is Linux/GPU-only.
 """
 
@@ -183,6 +190,7 @@ def backward_dv(
         HEAD_DIM=d,
         IS_CAUSAL=causal,
         num_warps=8 if d >= 128 else 4,
+        num_stages=2 if d >= 128 else 3,
     )
     return dv
 
@@ -533,6 +541,7 @@ def backward_dk(
         HEAD_DIM=d,
         IS_CAUSAL=causal,
         num_warps=8 if d >= 128 else 4,
+        num_stages=2 if d >= 128 else 3,
     )
     return dk
 
@@ -579,5 +588,6 @@ def backward_dq(
         HEAD_DIM=d,
         IS_CAUSAL=causal,
         num_warps=8 if d >= 128 else 4,
+        num_stages=2 if d >= 128 else 3,
     )
     return dq
