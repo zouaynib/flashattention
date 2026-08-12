@@ -1,0 +1,100 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B",
+  "gpu": "NVIDIA RTX A5000",
+  "note": "step_time_ms is a single unwarmed measurement and includes Triton JIT compilation on first call; it is NOT comparable to the do_bench figures in sweep.csv and should not be plotted",
+  "results": [
+    {
+      "impl": "eager",
+      "seq_len": 1024,
+      "peak_memory_mb": 6189.2,
+      "step_time_ms": 689.7,
+      "loss": 13.2976,
+      "status": "ok"
+    },
+    {
+      "impl": "eager",
+      "seq_len": 2048,
+      "peak_memory_mb": 15459.0,
+      "step_time_ms": 373.6,
+      "loss": 13.4223,
+      "status": "ok"
+    },
+    {
+      "impl": "eager",
+      "seq_len": 4096,
+      "peak_memory_mb": null,
+      "step_time_ms": null,
+      "loss": null,
+      "status": "oom"
+    },
+    {
+      "impl": "sdpa",
+      "seq_len": 1024,
+      "peak_memory_mb": 4779.5,
+      "step_time_ms": 168.1,
+      "loss": 13.3864,
+      "status": "ok"
+    },
+    {
+      "impl": "sdpa",
+      "seq_len": 2048,
+      "peak_memory_mb": 7476.7,
+      "step_time_ms": 347.5,
+      "loss": 13.4344,
+      "status": "ok"
+    },
+    {
+      "impl": "sdpa",
+      "seq_len": 4096,
+      "peak_memory_mb": 13788.2,
+      "step_time_ms": 388.6,
+      "loss": 13.3826,
+      "status": "ok"
+    },
+    {
+      "impl": "sdpa",
+      "seq_len": 8192,
+      "peak_memory_mb": null,
+      "step_time_ms": null,
+      "loss": null,
+      "status": "oom"
+    },
+    {
+      "impl": "flash_triton",
+      "seq_len": 1024,
+      "peak_memory_mb": 4778.7,
+      "step_time_ms": 1247.1,
+      "loss": 13.4035,
+      "status": "ok"
+    },
+    {
+      "impl": "flash_triton",
+      "seq_len": 2048,
+      "peak_memory_mb": 7332.7,
+      "step_time_ms": 233.5,
+      "loss": 13.4413,
+      "status": "ok"
+    },
+    {
+      "impl": "flash_triton",
+      "seq_len": 4096,
+      "peak_memory_mb": 13500.2,
+      "step_time_ms": 377.5,
+      "loss": 13.4139,
+      "status": "ok"
+    },
+    {
+      "impl": "flash_triton",
+      "seq_len": 8192,
+      "peak_memory_mb": null,
+      "step_time_ms": null,
+      "loss": null,
+      "status": "oom"
+    }
+  ],
+  "longest_context_reached": {
+    "eager": 2048,
+    "sdpa": 4096,
+    "flash_triton": 4096
+  }
+}

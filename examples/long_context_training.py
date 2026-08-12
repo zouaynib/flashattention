@@ -237,6 +237,16 @@ def main() -> None:
     print(f"worst step-wise difference: {max(diffs):.6f}")
     print(f"loss reduction   sdpa {a[0] - a[-1]:.4f}   ours {b[0] - b[-1]:.4f}")
 
+    # Also write a compact CSV. JSON with 120 floats is unreadable in a terminal,
+    # and on an ephemeral machine the terminal is often the only way results get
+    # off the box before it is destroyed.
+    csv_path = RESULTS / "long_context_curves.csv"
+    with csv_path.open("w") as f:
+        f.write("step,sdpa,flash_triton\n")
+        for i, (x, y) in enumerate(zip(a, b)):
+            f.write(f"{i},{x:.6f},{y:.6f}\n")
+    print(f"wrote {csv_path}")
+
     out = RESULTS / "long_context_curves.json"
     out.write_text(
         json.dumps(

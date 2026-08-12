@@ -1,0 +1,29 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B",
+  "dataset": "wikitext-103-raw-v1 (test)",
+  "gpu": "NVIDIA RTX A5000",
+  "results": [
+    {
+      "impl": "sdpa",
+      "seq_len": 2048,
+      "chunks": 146,
+      "tokens": 299008,
+      "loss": 2.570789,
+      "perplexity": 13.0761,
+      "peak_memory_mb": 3955.8,
+      "kernel_calls": 0
+    },
+    {
+      "impl": "flash_triton",
+      "seq_len": 2048,
+      "chunks": 146,
+      "tokens": 299008,
+      "loss": 2.5708,
+      "perplexity": 13.0763,
+      "peak_memory_mb": 3956.0,
+      "kernel_calls": 3504
+    }
+  ],
+  "max_per_chunk_loss_difference": 0.002939,
+  "max_absolute_logit_difference": 0.4375
+}
