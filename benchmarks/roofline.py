@@ -133,7 +133,8 @@ def report(fwd, ceilings: Ceilings) -> None:
         )
 
     sat = sub[sub.seq_len >= 4096]
-    print(f"saturated at {sat.pct_of_peak_compute.mean():.0f}% of assumed peak compute")
+    kind = "measured" if "measured" in ceilings.source else "assumed"
+    print(f"saturated at {sat.pct_of_peak_compute.mean():.0f}% of {kind} peak compute")
 
     # The measurements bound their own ceiling: no implementation can exceed
     # the hardware, so the fastest observed rate is a floor on the true peak.

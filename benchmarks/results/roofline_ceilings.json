@@ -1,6 +1,6 @@
 {
-  "peak_tflops": 111.1,
-  "peak_bandwidth_gbs": 768.0,
-  "ridge_point_flops_per_byte": 144.66145833333334,
-  "source": "datasheet (unmeasured -- assumes fp16 accumulate, so likely optimistic)"
+  "peak_tflops": 86.6,
+  "peak_bandwidth_gbs": 680.7,
+  "ridge_point_flops_per_byte": 127.22197737623036,
+  "source": "measured on NVIDIA RTX A5000"
 }
