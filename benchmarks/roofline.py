@@ -23,16 +23,21 @@ Both ceilings are MEASURED here rather than taken from a datasheet. Vendor
 uses neither, so quoting them would flatter the result by roughly 2x. Without a
 GPU the script falls back to documented specs and says so.
 
-    python benchmarks/roofline.py
+    python benchmarks/roofline.py --measure-only   # on the GPU box
+    python benchmarks/roofline.py                 # anywhere, using those ceilings
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
 
-import pandas as pd
+# pandas and matplotlib are imported lazily inside the analysis functions.
+# Measuring the hardware ceilings needs a GPU but no analysis stack; the
+# analysis needs the stack but no GPU. Keeping the imports local lets each half
+# run where it belongs, which matters when the GPU box is a minimal container.
 
 RESULTS = Path(__file__).parent / "results"
 
@@ -86,7 +91,7 @@ def measure_ceilings() -> Ceilings:
     return Ceilings(peak_tflops, peak_bandwidth_gbs, f"measured on {torch.cuda.get_device_name(0)}")
 
 
-def analyse(df: pd.DataFrame, ceilings: Ceilings) -> pd.DataFrame:
+def analyse(df, ceilings: Ceilings):
     """Attach arithmetic intensity and achieved rates to each forward result."""
     fwd = df[(df["mode"] == "forward") & (df.status == "ok")].copy()
 
@@ -103,7 +108,7 @@ def analyse(df: pd.DataFrame, ceilings: Ceilings) -> pd.DataFrame:
     return fwd
 
 
-def report(fwd: pd.DataFrame, ceilings: Ceilings) -> None:
+def report(fwd, ceilings: Ceilings) -> None:
     print(f"peak compute   : {ceilings.peak_tflops:7.1f} TFLOP/s")
     print(f"peak bandwidth : {ceilings.peak_bandwidth_gbs:7.1f} GB/s")
     print(f"ridge point    : {ceilings.ridge_point:7.1f} FLOP/byte")
@@ -141,7 +146,7 @@ def report(fwd: pd.DataFrame, ceilings: Ceilings) -> None:
         print("  -> WARNING: observed exceeds the assumed peak; the ceiling is wrong")
 
 
-def roofline_plot(fwd: pd.DataFrame, ceilings: Ceilings) -> None:
+def roofline_plot(fwd, ceilings: Ceilings) -> None:
     """The classic roofline: attainable performance against arithmetic intensity.
 
     The sloped roof is the bandwidth limit, the flat roof the compute limit, and
@@ -189,17 +194,12 @@ def roofline_plot(fwd: pd.DataFrame, ceilings: Ceilings) -> None:
     print("wrote", RESULTS / "roofline.png")
 
 
-def main() -> None:
-    df = pd.read_csv(RESULTS / "sweep.csv")
-    df["causal"] = df["causal"].astype(bool)
+CEILINGS_PATH = RESULTS / "roofline_ceilings.json"
 
-    ceilings = measure_ceilings()
-    fwd = analyse(df, ceilings)
-    report(fwd, ceilings)
-    roofline_plot(fwd, ceilings)
 
-    fwd.to_csv(RESULTS / "roofline.csv", index=False)
-    (RESULTS / "roofline_ceilings.json").write_text(
+def save_ceilings(ceilings: Ceilings) -> None:
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    CEILINGS_PATH.write_text(
         json.dumps(
             {
                 "peak_tflops": ceilings.peak_tflops,
@@ -210,7 +210,48 @@ def main() -> None:
             indent=2,
         )
     )
-    print(f"\nwrote {RESULTS / 'roofline.csv'} and {RESULTS / 'roofline_ceilings.json'}")
+    print(f"peak compute   : {ceilings.peak_tflops:7.1f} TFLOP/s")
+    print(f"peak bandwidth : {ceilings.peak_bandwidth_gbs:7.1f} GB/s")
+    print(f"ridge point    : {ceilings.ridge_point:7.1f} FLOP/byte")
+    print(f"source         : {ceilings.source}")
+    print(f"wrote {CEILINGS_PATH}")
+
+
+def load_ceilings() -> Ceilings:
+    """Prefer ceilings measured on real hardware over the datasheet."""
+    if CEILINGS_PATH.exists():
+        saved = json.loads(CEILINGS_PATH.read_text())
+        if "measured" in saved.get("source", ""):
+            return Ceilings(saved["peak_tflops"], saved["peak_bandwidth_gbs"], saved["source"])
+    return measure_ceilings()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--measure-only",
+        action="store_true",
+        help="measure this machine's ceilings and exit; needs a GPU but no analysis stack",
+    )
+    args = parser.parse_args()
+
+    if args.measure_only:
+        save_ceilings(measure_ceilings())
+        return
+
+    import pandas as pd
+
+    df = pd.read_csv(RESULTS / "sweep.csv")
+    df["causal"] = df["causal"].astype(bool)
+
+    ceilings = load_ceilings()
+    fwd = analyse(df, ceilings)
+    report(fwd, ceilings)
+    roofline_plot(fwd, ceilings)
+
+    fwd.to_csv(RESULTS / "roofline.csv", index=False)
+    save_ceilings(ceilings)
+    print(f"wrote {RESULTS / 'roofline.csv'}")
 
 
 if __name__ == "__main__":
