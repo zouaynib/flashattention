@@ -1,0 +1,6 @@
+{
+  "peak_tflops": 111.1,
+  "peak_bandwidth_gbs": 768.0,
+  "ridge_point_flops_per_byte": 144.66145833333334,
+  "source": "datasheet (unmeasured -- assumes fp16 accumulate, so likely optimistic)"
+}
