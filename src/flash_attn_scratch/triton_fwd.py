@@ -17,7 +17,7 @@ Built up incrementally:
 * `_running_sum_kernel` -- adds the running denominator l and the rescaling
   factor alpha = exp(m_old - m_new). This is the core of online softmax.
 * `_running_output_kernel` -- adds the output accumulator. Online softmax is
-  complete here; steps 9-10 are assembly and masking.
+  complete here; what follows is assembly and masking.
 * `_fwd_kernel` / `flash_attention_forward` -- the assembled forward pass,
   normalized in-kernel and returning the input dtype, with causal masking.
   This is the public API.
@@ -298,7 +298,7 @@ def _softmax_tile_kernel(
     a denominator that is about to change.
 
     This is a correct softmax over the wrong set: the true denominator runs
-    over all N keys, not just this block's BLOCK_N. Steps 6-8 fix that.
+    over all N keys, not just this block's BLOCK_N. The running statistics below fix that.
     """
     off_hz = tl.program_id(0)
     off_b = off_hz // H
@@ -550,7 +550,7 @@ def _running_sum_kernel(
 
     On the first iteration m^(0) = -inf gives alpha = 0, which correctly zeroes
     the empty accumulator. That relies on every row seeing at least one valid
-    key; causal masking (step 10) breaks that assumption and needs care.
+    key; causal masking breaks that assumption and needs care.
     """
     start_m = tl.program_id(0)
     off_hz = tl.program_id(1)
@@ -760,7 +760,8 @@ def running_output_accumulator(
         m: (B, H, N) row maxima.
         l: (B, H, N) softmax denominators.
 
-        Attention output is o / l[..., None]. Step 9 wraps that up.
+        Attention output is o / l[..., None]; the assembled kernel does that
+        division in-kernel.
     """
     if not (q.shape == k.shape == v.shape):
         raise ValueError(f"q/k/v must share a shape, got {q.shape}, {k.shape}, {v.shape}")
@@ -921,7 +922,7 @@ def _fwd_kernel(
         # Only blocks straddling the diagonal actually need this; blocks fully
         # below it are entirely valid. Applying it uniformly is correct but
         # leaves non-matmul work in the hot loop -- splitting the loop into an
-        # unmasked range plus a masked diagonal range is a Phase 5 tuning item.
+        # unmasked range plus a masked diagonal range is a tuning item.
         if IS_CAUSAL:
             s = tl.where(offs_m[:, None] + causal_offset >= offs_n[None, :], s, float("-inf"))
 
@@ -1009,9 +1010,8 @@ def flash_attention_forward(
         raise ValueError(f"head_dim must be >= 16 for the tensor-core path, got {d}")
 
     # Heuristic rather than autotuning: @triton.autotune recompiles across the
-    # config space per shape, which would contaminate the Phase 5 latency
-    # measurements. Tuning belongs with the benchmark harness, where the
-    # tradeoff is measurable.
+    # config space per shape, which would contaminate latency measurements.
+    # Tuning belongs with the benchmark harness, where it is measurable.
     if block_m is None:
         block_m = 64 if d >= 128 else 128
     if block_n is None:

@@ -1,4 +1,4 @@
-"""Step 13: gradients with respect to Q and K, plus the D = rowsum(dO * O) term.
+"""Gradients with respect to Q and K, plus the D = rowsum(dO * O) term.
 
 All three gradients are checked in one pass per case: the fp32 autograd
 reference is the expensive part, so computing it once and comparing dQ, dK and

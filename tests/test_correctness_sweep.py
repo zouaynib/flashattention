@@ -1,4 +1,4 @@
-"""Step 15: the full correctness sweep across shapes, dtypes and causal settings.
+"""The full correctness sweep across shapes, dtypes and causal settings.
 
 Tolerances are per-dtype rather than one loose bound for both. bf16 carries 8
 mantissa bits against fp16's 10, so it is roughly 4x less precise per value; a

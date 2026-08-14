@@ -1,6 +1,7 @@
 """Figures for the HuggingFace integration experiments.
 
-Reads the Phase 6 result files and writes PNGs alongside them. No GPU needed.
+Reads the HuggingFace integration results and writes PNGs alongside them.
+No GPU needed.
 
     python benchmarks/plot_integration.py
 """

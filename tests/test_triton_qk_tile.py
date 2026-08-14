@@ -1,4 +1,4 @@
-"""Step 4: one tile of S = QK^T / sqrt(d), against a manual PyTorch slice.
+"""One tile of S = QK^T / sqrt(d), against a manual PyTorch slice.
 
 Tolerances are tight on purpose. Both sides consume the *same* fp16 tensors,
 so fp16 input rounding is common to both and cancels; tensor cores multiply

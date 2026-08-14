@@ -1,6 +1,6 @@
-"""Step 8: the running output accumulator -- online softmax, complete.
+"""The running output accumulator -- online softmax, complete.
 
-Tolerances are looser here than in steps 4-7, for a substantive reason. Until
+Tolerances are looser here than in the earlier tile-level tests, for a substantive reason. Until
 now both sides consumed identical fp16 tensors, so fp16 rounding was common to
 both and cancelled, which let the earlier tests hold 1e-3. This kernel casts P
 to fp16 internally (to reach tensor cores) while the fp32 reference does not,
@@ -44,7 +44,7 @@ def _reference(q, k, v, sm_scale):
     ],
 )
 def test_normalized_output_matches_naive_attention(b, h, n, d):
-    """The real check: o / l is attention, against the step-2 ground truth."""
+    """The real check: o / l is attention, against the fp32 baseline."""
     torch.manual_seed(0)
     q, k, v = (torch.randn(b, h, n, d, device="cuda", dtype=torch.float16) for _ in range(3))
 
@@ -76,7 +76,7 @@ def test_accumulator_rescaling_with_a_late_maximum(spike_at):
     """alpha must rescale the (BLOCK_M, HEAD_DIM) accumulator, not just l.
 
     Forgetting `acc = acc * alpha[:, None]` leaves l correct and o wrong, so
-    this catches a bug the step-7 tests cannot see.
+    this catches a bug the denominator tests cannot see.
     """
     torch.manual_seed(0)
     b, h, n, d = 1, 2, 256, 64

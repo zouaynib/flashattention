@@ -1,4 +1,4 @@
-"""Step 7: the online softmax denominator, with rescaling.
+"""The online softmax denominator, with rescaling.
 
 The claim under test: l accumulated blockwise, with alpha = exp(m_old - m_new)
 correcting each time the max grows, equals sum_j exp(s_ij - m_i) over the whole

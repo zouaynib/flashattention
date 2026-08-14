@@ -1,4 +1,4 @@
-"""Step 6: the running row max, checked against torch.max over the full row.
+"""The running row max, checked against torch.max over the full row.
 
 This is the first step where the kernel loops over K blocks. The property under
 test is that a value accumulated blockwise equals the value computed over the

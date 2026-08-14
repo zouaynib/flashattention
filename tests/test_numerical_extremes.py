@@ -1,4 +1,4 @@
-"""Step 16: tests that fail if the max subtraction is removed.
+"""Tests that fail if the max subtraction is removed.
 
 Every other test in this repo uses N(0,1) inputs, where scores land in roughly
 [-5, 5]. exp() of that is unremarkable, so the safe-softmax machinery -- the

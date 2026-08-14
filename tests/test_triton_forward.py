@@ -1,6 +1,6 @@
-"""Step 9: the assembled forward pass, end to end.
+"""The assembled forward pass, end to end.
 
-Checked against both references: the naive baseline from step 2 (which is
+Checked against both references: the naive fp32 baseline (which is
 transparently correct) and PyTorch's own SDPA (which is independently
 implemented). Agreeing with both is a much stronger claim than agreeing with
 either alone.

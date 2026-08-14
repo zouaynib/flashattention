@@ -1,8 +1,8 @@
-"""Step 12: gradient with respect to V, tested in isolation.
+"""Gradient with respect to V, tested in isolation.
 
-Ground truth is autograd through the naive baseline, which step 2 already
+Ground truth is autograd through the naive fp32 baseline, which is itself
 verified against PyTorch's SDPA gradients. So this is checked against a
-reference that is itself independently validated.
+reference that is independently validated.
 """
 
 import math

@@ -1,7 +1,7 @@
 """Scaffold smoke tests: prove the package layout and GPU-skip plumbing work.
 
 Placeholder for the real correctness suite, which arrives with the naive
-baseline (step 2) and the Triton kernel (steps 3+).
+baseline and the Triton kernels.
 """
 
 import pytest

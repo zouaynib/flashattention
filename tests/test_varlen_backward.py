@@ -1,4 +1,4 @@
-"""Step 21: differing query and key lengths in the backward pass.
+"""Differing query and key lengths in the backward pass.
 
 Mirrors the forward case with one asymmetry. dQ's loop bound is the same as the
 forward pass -- query row m reads up to key m + offset. dK and dV invert it: key

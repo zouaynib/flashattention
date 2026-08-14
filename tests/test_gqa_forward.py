@@ -1,4 +1,4 @@
-"""Step 18: grouped-query and multi-query attention in the forward pass.
+"""Grouped-query and multi-query attention in the forward pass.
 
 Q carries H_q heads while K and V carry H_kv, with query head h reading KV head
 h // (H_q / H_kv). This is the attention shape Llama 3, Mistral and most current
@@ -135,8 +135,8 @@ def test_rejects_non_divisible_head_counts(h_q, h_kv):
 
 
 def test_rejects_mismatched_batch_or_head_dim():
-    """Head count may differ (GQA, step 18) and so may sequence length (step
-    20). Batch and head_dim may not -- those are genuine shape errors."""
+    """Head count may differ (grouped-query attention) and so may sequence
+    length. Batch and head_dim may not -- those are genuine shape errors."""
     q = torch.randn(1, 8, 64, 64, device="cuda", dtype=torch.float16)
 
     wrong_head_dim = torch.randn(1, 4, 64, 32, device="cuda", dtype=torch.float16)
@@ -149,7 +149,7 @@ def test_rejects_mismatched_batch_or_head_dim():
 
 
 def test_autograd_accepts_gqa():
-    """GQA works end to end through autograd as of step 19, and dK/dV come back
+    """GQA works end to end through autograd now, and dK/dV come back
     shaped like their inputs rather than expanded to H_q."""
     q = torch.randn(1, 8, 64, 64, device="cuda", dtype=torch.float16, requires_grad=True)
     k = torch.randn(1, 4, 64, 64, device="cuda", dtype=torch.float16, requires_grad=True)

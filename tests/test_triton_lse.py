@@ -1,4 +1,4 @@
-"""Step 11: the saved forward statistic, L = m + log(l).
+"""The saved forward statistic, L = m + log(l).
 
 L is what makes the backward pass memory-efficient. Instead of storing the
 N x N probability matrix, we store one fp32 per query row and rebuild any

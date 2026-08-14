@@ -1,4 +1,4 @@
-"""Step 19: grouped-query attention in the backward pass.
+"""Grouped-query attention in the backward pass.
 
 The subtlety is dK and dV. One K/V head is read by GROUP_SIZE query heads, so
 its gradient is the SUM of the gradients each of those heads produces. Get that

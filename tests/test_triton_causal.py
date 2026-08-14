@@ -1,4 +1,4 @@
-"""Step 10: causal masking, tested separately from the unmasked case.
+"""Causal masking, tested separately from the unmasked case.
 
 Causal is the LLM-relevant configuration -- every decoder-only transformer uses
 it. It is also where the loop bound and the mask have to agree exactly: an
@@ -117,7 +117,7 @@ def test_causal_independent_of_block_sizes(block_m, block_n):
 
 
 def test_causal_produces_no_nans():
-    """The trap from step 7: a fully-masked block would give alpha = NaN.
+    """The trap noted in the kernel: a fully-masked block would give alpha = NaN.
 
     Bounding the loop at the diagonal is what prevents it, so this is the
     regression test for that reasoning.

@@ -34,7 +34,7 @@ def test_matches_sdpa(b, h, n, d, causal):
 @pytest.mark.parametrize("causal", [False, True])
 def test_gradients_match_sdpa(causal):
     """Autograd through the baseline gives the reference gradients that the
-    hand-written backward kernel (steps 12-13) will be checked against."""
+    hand-written backward kernel (the backward kernels) will be checked against."""
     torch.manual_seed(0)
     tensors = [torch.randn(2, 2, 32, 16, dtype=torch.float32, requires_grad=True) for _ in range(3)]
     q, k, v = tensors

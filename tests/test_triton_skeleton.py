@@ -1,4 +1,4 @@
-"""Step 3: prove the Triton launch and addressing path works.
+"""Prove the Triton launch and addressing path works.
 
 `importorskip` runs at collection time, so this file is skipped cleanly on a
 machine without Triton (macOS) instead of erroring during import.

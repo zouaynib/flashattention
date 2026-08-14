@@ -1,4 +1,4 @@
-"""Step 20: differing query and key lengths in the forward pass.
+"""Differing query and key lengths in the forward pass.
 
 M queries against N keys. The case that matters is M < N -- KV-cache decoding,
 where the M new queries are the LAST M positions of an N-long sequence and must
@@ -172,7 +172,7 @@ def test_more_queries_than_keys_is_fine_without_causal():
 
 
 def test_autograd_accepts_varlen():
-    """Supported end to end as of step 21; gradients keep their input shapes."""
+    """Supported end to end now; gradients keep their input shapes."""
     q = torch.randn(1, 1, 8, 64, device="cuda", dtype=torch.float16, requires_grad=True)
     k = torch.randn(1, 1, 64, 64, device="cuda", dtype=torch.float16, requires_grad=True)
     v = torch.randn(1, 1, 64, 64, device="cuda", dtype=torch.float16, requires_grad=True)

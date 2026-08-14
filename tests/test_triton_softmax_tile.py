@@ -1,8 +1,8 @@
-"""Step 5: safe softmax over a single tile.
+"""Safe softmax over a single tile.
 
 Not online yet -- the denominator here covers one K block, not the whole row.
 These tests check that the tile-local softmax is exactly right, so that when
-steps 6-8 add cross-block bookkeeping, any failure is in the bookkeeping.
+the running max, sum and accumulator add cross-block bookkeeping, any failure is in the bookkeeping.
 """
 
 import math

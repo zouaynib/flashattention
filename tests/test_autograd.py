@@ -1,4 +1,4 @@
-"""Step 14: the autograd.Function, tested as a real PyTorch operation.
+"""The autograd.Function, tested as a real PyTorch operation.
 
 These tests use `loss.backward()` rather than calling the backward kernels
 directly, so they exercise what a model would actually hit: tensor saving,
