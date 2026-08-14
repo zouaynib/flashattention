@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Online softmax, one block at a time</title>
+<style>
+  :root {
+    --bg: #fbfaf8; --fg: #1c1b19; --muted: #6b6864; --line: #ddd8d0;
+    --card: #ffffff; --accent: #0b6e4f; --hot: #c1440e; --cool: #1b6ca8;
+    --seen: #e8f0ec; --current: #fdf0e6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16151a; --fg: #eceae6; --muted: #9a958e; --line: #33313a;
+      --card: #1e1d23; --accent: #4ec49a; --hot: #ef8354; --cool: #6cb6e8;
+      --seen: #1c2b26; --current: #2e2620;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1.25rem 4rem; background: var(--bg); color: var(--fg);
+    font: 16px/1.6 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 60rem; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin: 0 0 .3rem; letter-spacing: -.02em; }
+  .sub { color: var(--muted); margin: 0 0 2rem; max-width: 46rem; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 1.25rem; margin-bottom: 1.25rem;
+  }
+  h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .09em;
+       color: var(--muted); margin: 0 0 .9rem; font-weight: 600; }
+  .keys { display: flex; gap: .4rem; flex-wrap: wrap; }
+  .key {
+    flex: 1 1 4.5rem; min-width: 4.5rem; border: 1px solid var(--line);
+    border-radius: 7px; padding: .5rem .4rem; text-align: center;
+    background: var(--bg); transition: background .25s, border-color .25s, transform .25s;
+  }
+  .key.seen { background: var(--seen); }
+  .key.current { background: var(--current); border-color: var(--hot); transform: translateY(-3px); }
+  .key .idx { font-size: .68rem; color: var(--muted); }
+  .key .score { font-variant-numeric: tabular-nums; font-size: 1.05rem; font-weight: 600; }
+  .key .weight { font-size: .7rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .key.unseen .score, .key.unseen .weight { opacity: .22; }
+
+  .state { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 1rem; }
+  .stat { border-left: 3px solid var(--line); padding-left: .8rem; }
+  .stat .name { font-size: .78rem; color: var(--muted); }
+  .stat .val { font-size: 1.5rem; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .stat .was { font-size: .75rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .stat.changed { border-left-color: var(--hot); }
+
+  .alpha {
+    margin-top: 1rem; padding: .8rem 1rem; border-radius: 8px;
+    background: var(--current); border: 1px solid var(--hot);
+    font-size: .92rem;
+  }
+  .alpha.idle { background: transparent; border-color: var(--line); color: var(--muted); }
+  .alpha b { color: var(--hot); font-variant-numeric: tabular-nums; }
+  .alpha.idle b { color: var(--muted); }
+
+  .narrate { min-height: 3.2rem; }
+  .narrate p { margin: 0; }
+  .controls { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin-bottom: 1.25rem; }
+  button {
+    font: inherit; font-size: .92rem; padding: .45rem 1rem; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .progress { margin-left: auto; color: var(--muted); font-size: .85rem; font-variant-numeric: tabular-nums; }
+
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: .9rem; }
+  th, td { text-align: right; padding: .35rem .6rem; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 600; font-size: .78rem; }
+  .ok { color: var(--accent); font-weight: 600; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .88em; }
+  footer { color: var(--muted); font-size: .85rem; margin-top: 2rem; }
+  a { color: var(--cool); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Online softmax, one block at a time</h1>
+  <p class="sub">
+    Softmax needs the largest value in a row before it can turn scores into
+    percentages. FlashAttention never sees a whole row at once — it reads a few
+    keys at a time. This is the trick that makes that work, on real numbers.
+  </p>
+
+  <div class="controls">
+    <button id="prev">◀ Back</button>
+    <button id="next" class="primary">Next ▶</button>
+    <button id="play">Play</button>
+    <button id="reset">Reset</button>
+    <span class="progress" id="progress"></span>
+  </div>
+
+  <div class="card">
+    <h2>The eight keys, and their scores</h2>
+    <div class="keys" id="keys"></div>
+  </div>
+
+  <div class="card narrate">
+    <h2>What just happened</h2>
+    <p id="narration"></p>
+  </div>
+
+  <div class="card">
+    <h2>Everything the algorithm remembers</h2>
+    <div class="state">
+      <div class="stat" id="stat-m">
+        <div class="name">m — largest score so far</div>
+        <div class="val" id="val-m">−∞</div>
+        <div class="was" id="was-m">&nbsp;</div>
+      </div>
+      <div class="stat" id="stat-l">
+        <div class="name">ℓ — running denominator</div>
+        <div class="val" id="val-l">0</div>
+        <div class="was" id="was-l">&nbsp;</div>
+      </div>
+      <div class="stat" id="stat-o">
+        <div class="name">O — running output</div>
+        <div class="val" id="val-o">[0, 0]</div>
+        <div class="was" id="was-o">&nbsp;</div>
+      </div>
+    </div>
+    <div class="alpha idle" id="alpha"></div>
+  </div>
+
+  <div class="card" id="final-card" hidden>
+    <h2>Did it work?</h2>
+    <table>
+      <thead><tr><th>quantity</th><th>online (block by block)</th><th>textbook (whole row at once)</th></tr></thead>
+      <tbody id="final-body"></tbody>
+    </table>
+  </div>
+
+  <footer>
+    Three numbers per row — <code>m</code>, <code>ℓ</code>, <code>O</code> — regardless of how
+    long the sequence is. That is why memory grows linearly instead of quadratically.
+    Part of <a href="https://github.com/zouaynib/flashattention">FlashAttention-2 from scratch</a>.
+  </footer>
+</main>
+
+<script>
+// ---------------------------------------------------------------------------
+// The example. Scores are chosen, not random: the largest arrives in the LAST
+// block so the correction factor has to do real work, and one middle block
+// leaves the maximum unchanged so the "nothing to fix" case is visible too.
+// ---------------------------------------------------------------------------
+const SCORES = [1.2, 0.8, 2.1, 1.5, 0.3, 0.9, 4.7, 2.2];
+const VALUES = [[1,0],[0,1],[2,1],[1,2],[0,0],[1,1],[3,0],[0,3]];
+const BLOCK = 2;
+
+const fmt = (x, p = 3) => Number(x).toFixed(p);
+const fmtVec = (v, p = 2) => "[" + v.map(x => fmt(x, p)).join(", ") + "]";
+
+/** Replay the online algorithm, recording the full state after every block. */
+function buildFrames() {
+  const frames = [{
+    block: -1, m: -Infinity, l: 0, O: [0, 0], alpha: null, prev: null,
+    narration: "Nothing has been read yet. The running maximum starts at −∞ and " +
+               "the totals at zero — the state the algorithm carries between blocks."
+  }];
+
+  let m = -Infinity, l = 0, O = [0, 0];
+
+  for (let b = 0; b * BLOCK < SCORES.length; b++) {
+    const lo = b * BLOCK, hi = lo + BLOCK;
+    const prev = { m, l, O: [...O] };
+
+    const blockMax = Math.max(...SCORES.slice(lo, hi));
+    const mNew = Math.max(m, blockMax);
+    // Everything accumulated so far was exponentiated against the OLD maximum.
+    // One multiply converts all of it to the new one.
+    const alpha = m === -Infinity ? 0 : Math.exp(m - mNew);
+
+    let blockSum = 0;
+    const blockOut = [0, 0];
+    for (let j = lo; j < hi; j++) {
+      const p = Math.exp(SCORES[j] - mNew);
+      blockSum += p;
+      blockOut[0] += p * VALUES[j][0];
+      blockOut[1] += p * VALUES[j][1];
+    }
+
+    l = l * alpha + blockSum;
+    O = [O[0] * alpha + blockOut[0], O[1] * alpha + blockOut[1]];
+    const rose = mNew > m;
+    m = mNew;
+
+    let narration;
+    if (b === 0) {
+      narration = `First block. The largest score in it is <b>${fmt(blockMax, 1)}</b>, so that ` +
+                  `becomes the running maximum. There is no history to correct yet.`;
+    } else if (rose) {
+      narration = `This block contains <b>${fmt(blockMax, 1)}</b>, larger than anything seen before ` +
+                  `(${fmt(prev.m, 1)}). Everything accumulated so far was measured against the old ` +
+                  `maximum, so it is all wrong — by exactly the same factor. One multiply by ` +
+                  `<b>α = ${fmt(alpha)}</b> repairs the entire history, however long it is.`;
+    } else {
+      narration = `The largest score here is <b>${fmt(blockMax, 1)}</b>, below the running maximum ` +
+                  `of ${fmt(prev.m, 1)}. Nothing needs correcting: α = 1, and this block simply ` +
+                  `adds to the totals.`;
+    }
+
+    frames.push({ block: b, m, l, O: [...O], alpha, prev, narration, rose });
+  }
+
+  const last = frames[frames.length - 1];
+  last.narration += " Every key has now been read. Dividing the output by ℓ gives the answer.";
+  return frames;
+}
+
+const FRAMES = buildFrames();
+
+/** The textbook computation, for comparison at the end. */
+function reference() {
+  const m = Math.max(...SCORES);
+  const w = SCORES.map(s => Math.exp(s - m));
+  const l = w.reduce((a, b) => a + b, 0);
+  const O = [0, 0];
+  w.forEach((p, j) => { O[0] += p * VALUES[j][0]; O[1] += p * VALUES[j][1]; });
+  return { m, l, out: [O[0] / l, O[1] / l], weights: w.map(p => p / l) };
+}
+const REF = reference();
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+const el = id => document.getElementById(id);
+let step = 0, timer = null;
+
+const keysEl = el("keys");
+SCORES.forEach((s, j) => {
+  const d = document.createElement("div");
+  d.className = "key unseen";
+  d.innerHTML = `<div class="idx">key ${j}</div><div class="score">${fmt(s, 1)}</div>` +
+                `<div class="weight" data-w="${j}">&nbsp;</div>`;
+  keysEl.appendChild(d);
+});
+
+function render() {
+  const f = FRAMES[step];
+  const done = step === FRAMES.length - 1;
+
+  [...keysEl.children].forEach((node, j) => {
+    const inCurrent = f.block >= 0 && j >= f.block * BLOCK && j < (f.block + 1) * BLOCK;
+    const seen = f.block >= 0 && j < (f.block + 1) * BLOCK;
+    node.className = "key" + (inCurrent ? " current" : seen ? " seen" : " unseen");
+    const w = node.querySelector("[data-w]");
+    w.innerHTML = done ? `${(REF.weights[j] * 100).toFixed(1)}%` : "&nbsp;";
+  });
+
+  el("narration").innerHTML = f.narration;
+
+  const set = (key, value, was, changed) => {
+    el("val-" + key).textContent = value;
+    el("was-" + key).innerHTML = was ? `was ${was}` : "&nbsp;";
+    el("stat-" + key).className = "stat" + (changed ? " changed" : "");
+  };
+  set("m", f.m === -Infinity ? "−∞" : fmt(f.m, 2),
+      f.prev && f.prev.m !== -Infinity ? fmt(f.prev.m, 2) : null, f.rose);
+  set("l", fmt(f.l), f.prev ? fmt(f.prev.l) : null, f.block >= 0);
+  set("o", fmtVec(f.O), f.prev ? fmtVec(f.prev.O) : null, f.block >= 0);
+
+  const a = el("alpha");
+  if (f.alpha === null || f.block < 0) {
+    a.className = "alpha idle";
+    a.innerHTML = "The correction factor <b>α</b> appears once there is history to correct.";
+  } else if (f.alpha === 0) {
+    a.className = "alpha idle";
+    a.innerHTML = "α = 0 on the first block — it zeroes an empty accumulator, which is correct.";
+  } else {
+    a.className = "alpha" + (f.rose ? "" : " idle");
+    a.innerHTML = `α = e<sup>(m<sub>old</sub> − m<sub>new</sub>)</sup> = ` +
+      `e<sup>(${fmt(f.prev.m, 2)} − ${fmt(f.m, 2)})</sup> = <b>${fmt(f.alpha)}</b>` +
+      (f.rose ? " — every past contribution was scaled down by this, in one multiply."
+              : " — the maximum did not move, so nothing changes.");
+  }
+
+  el("final-card").hidden = !done;
+  if (done) {
+    const online = [f.O[0] / f.l, f.O[1] / f.l];
+    el("final-body").innerHTML = `
+      <tr><td>row maximum, m</td><td>${fmt(f.m, 4)}</td><td>${fmt(REF.m, 4)}</td></tr>
+      <tr><td>denominator, ℓ</td><td>${fmt(f.l, 4)}</td><td>${fmt(REF.l, 4)}</td></tr>
+      <tr><td>output, O ÷ ℓ</td><td>${fmtVec(online, 4)}</td><td>${fmtVec(REF.out, 4)}</td></tr>
+      <tr><td class="ok">identical</td><td colspan="2" class="ok">
+        reading two keys at a time gives the same answer as reading all eight at once</td></tr>`;
+  }
+
+  el("progress").textContent = f.block < 0
+    ? "before the first block"
+    : `block ${f.block + 1} of ${FRAMES.length - 1}`;
+  el("prev").disabled = step === 0;
+  el("next").disabled = done;
+}
+
+function go(to) {
+  step = Math.max(0, Math.min(FRAMES.length - 1, to));
+  render();
+  if (step === FRAMES.length - 1) stop();
+}
+function stop() { clearInterval(timer); timer = null; el("play").textContent = "Play"; }
+
+el("next").onclick = () => { stop(); go(step + 1); };
+el("prev").onclick = () => { stop(); go(step - 1); };
+el("reset").onclick = () => { stop(); go(0); };
+el("play").onclick = () => {
+  if (timer) return stop();
+  if (step === FRAMES.length - 1) go(0);
+  el("play").textContent = "Pause";
+  timer = setInterval(() => go(step + 1), 2600);
+};
+document.addEventListener("keydown", e => {
+  if (e.key === "ArrowRight") { stop(); go(step + 1); }
+  if (e.key === "ArrowLeft") { stop(); go(step - 1); }
+});
+
+render();
+</script>
+</body>
+</html>
