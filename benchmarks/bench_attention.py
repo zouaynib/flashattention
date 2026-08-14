@@ -38,8 +38,8 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from flash_attn.autograd import flash_attention
-from flash_attn.naive import standard_attention
+from flash_attn_scratch.autograd import flash_attention
+from flash_attn_scratch.naive import standard_attention
 
 RESULTS_DIR = Path(__file__).parent / "results"
 

@@ -32,7 +32,7 @@ sm_90 (Hopper); on Ampere (sm_86) it buys nothing, and the explicit form keeps
 the index math visible.
 
 Importing this module requires Triton, which is Linux/GPU-only. It is
-deliberately not imported from `flash_attn/__init__.py`.
+deliberately not imported from `flash_attn_scratch/__init__.py`.
 """
 
 import math

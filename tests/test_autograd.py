@@ -10,8 +10,8 @@ import torch
 
 pytest.importorskip("triton", reason="Triton is Linux/GPU-only")
 
-from flash_attn.autograd import flash_attention  # noqa: E402
-from flash_attn.naive import naive_attention  # noqa: E402
+from flash_attn_scratch.autograd import flash_attention  # noqa: E402
+from flash_attn_scratch.naive import naive_attention  # noqa: E402
 
 pytestmark = pytest.mark.gpu
 
@@ -50,7 +50,7 @@ def test_forward_value_is_unchanged_by_the_wrapper():
     torch.manual_seed(0)
     q, k, v = _make(1, 2, 256, 64, requires_grad=False)
 
-    from flash_attn.triton_fwd import flash_attention_forward
+    from flash_attn_scratch.triton_fwd import flash_attention_forward
 
     assert torch.equal(flash_attention(q, k, v, causal=True), flash_attention_forward(q, k, v, causal=True))
 

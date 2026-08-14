@@ -2,7 +2,7 @@
 
 Registers under the name "flash_triton", so a model picks it up with:
 
-    from flash_attn.hf import register
+    from flash_attn_scratch.hf import register
     register()
     model = AutoModelForCausalLM.from_pretrained(
         "Qwen/Qwen2.5-0.5B", dtype=torch.bfloat16, attn_implementation="flash_triton"
@@ -30,7 +30,7 @@ from typing import Any
 
 import torch
 
-from flash_attn.autograd import flash_attention
+from flash_attn_scratch.autograd import flash_attention
 
 ATTENTION_NAME = "flash_triton"
 

@@ -18,7 +18,7 @@ transformers = pytest.importorskip("transformers", reason="transformers not inst
 
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS  # noqa: E402
 
-from flash_attn.hf import (  # noqa: E402
+from flash_attn_scratch.hf import (  # noqa: E402
     ATTENTION_NAME,
     flash_attention_interface,
     register,
@@ -128,7 +128,7 @@ def test_registration_makes_the_name_available():
 def test_call_count_tracks_invocations():
     """Experiments assert on this to prove the kernel really ran, rather than
     trusting that registration took effect."""
-    import flash_attn.hf as hf
+    import flash_attn_scratch.hf as hf
 
     reset_call_count()
     before = hf.call_count

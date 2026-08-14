@@ -35,7 +35,7 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from flash_attn.autograd import flash_attention
+from flash_attn_scratch.autograd import flash_attention
 
 RESULTS = Path(__file__).parent / "results"
 
@@ -131,8 +131,14 @@ def load_triton_tutorial(path: str | None):
 
 
 def load_flash_attn():
+    """Tri Dao's package, whose import name is `flash_attn`.
+
+    That collision is why this project's package is `flash_attn_scratch`:
+    installing the official library alongside a package named `flash_attn`
+    shadows it, and every import in the repo breaks.
+    """
     try:
-        from flash_attn import flash_attn_func
+        from flash_attn import flash_attn_func  # the official package
 
         return flash_attn_func
     except Exception:

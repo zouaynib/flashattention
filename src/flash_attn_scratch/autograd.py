@@ -20,8 +20,8 @@ import math
 
 import torch
 
-from flash_attn.triton_bwd import backward_dk, backward_dq, backward_dv, backward_preprocess
-from flash_attn.triton_fwd import flash_attention_forward
+from flash_attn_scratch.triton_bwd import backward_dk, backward_dq, backward_dv, backward_preprocess
+from flash_attn_scratch.triton_fwd import flash_attention_forward
 
 
 class FlashAttentionFunction(torch.autograd.Function):

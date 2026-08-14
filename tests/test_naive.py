@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flash_attn.naive import naive_attention, standard_attention
+from flash_attn_scratch.naive import naive_attention, standard_attention
 
 SHAPES = [
     (1, 1, 8, 8),  # smallest case that exercises the math

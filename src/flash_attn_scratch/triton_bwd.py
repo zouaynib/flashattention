@@ -35,7 +35,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flash_attn.triton_fwd import SUPPORTED_DTYPES
+from flash_attn_scratch.triton_fwd import SUPPORTED_DTYPES
 
 
 @triton.jit

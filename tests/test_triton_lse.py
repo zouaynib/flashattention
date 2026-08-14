@@ -12,7 +12,7 @@ import torch
 
 pytest.importorskip("triton", reason="Triton is Linux/GPU-only")
 
-from flash_attn.triton_fwd import flash_attention_forward  # noqa: E402
+from flash_attn_scratch.triton_fwd import flash_attention_forward  # noqa: E402
 
 pytestmark = pytest.mark.gpu
 

@@ -35,7 +35,7 @@ from pathlib import Path
 
 import torch
 
-import flash_attn.hf as hf
+import flash_attn_scratch.hf as hf
 
 MODEL_ID = "Qwen/Qwen2.5-0.5B"
 RESULTS = Path(__file__).parent.parent / "benchmarks" / "results"

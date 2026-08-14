@@ -10,9 +10,9 @@ import torch
 
 def test_package_imports_without_triton():
     """The package must import on a CPU-only machine (no Triton available)."""
-    import flash_attn
+    import flash_attn_scratch
 
-    assert flash_attn.__version__
+    assert flash_attn_scratch.__version__
 
 
 @pytest.mark.gpu

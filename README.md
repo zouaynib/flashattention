@@ -9,7 +9,7 @@ memory-bandwidth bottleneck that limits long-context transformers.
 
 | Path | Contents |
 | --- | --- |
-| `src/flash_attn/` | Naive baseline and the Triton kernels |
+| `src/flash_attn_scratch/` | Naive baseline and the Triton kernels |
 | `tests/` | Correctness suite vs. PyTorch reference implementations |
 | `benchmarks/` | Latency and peak-memory sweeps, plots, raw data |
 | `viz/` | Interactive online-softmax explainer |
