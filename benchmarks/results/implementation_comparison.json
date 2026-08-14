@@ -1,0 +1,289 @@
+{
+  "gpu": "NVIDIA RTX A5000",
+  "torch": "2.4.1+cu124",
+  "triton": "3.0.0",
+  "config": {
+    "batch": 4,
+    "heads": 8,
+    "head_dim": 64,
+    "dtype": "torch.float16"
+  },
+  "sdpa_backend_detection": {
+    "inferred_backend": "FLASH_ATTENTION",
+    "cuda_kernels": [
+      "void pytorch_flash::flash_fwd_kernel<pytorch_flash::Flash_fwd_kernel_traits<64, 128, 128, 4, false, false, cutlass::half_t, ...>>(pytorch_flash::Flash_fwd_params)"
+    ]
+  },
+  "forced_backend_timings_ms": {
+    "default": 0.276151567697525,
+    "FLASH_ATTENTION": 0.2772480249404907,
+    "EFFICIENT_ATTENTION": 0.415402352809906,
+    "CUDNN_ATTENTION": null,
+    "MATH": 5.613824367523193
+  },
+  "agreement_vs_sdpa": {
+    "ours": 0.0009765625,
+    "sdpa": 0.0,
+    "triton_tutorial": 0.00048828125,
+    "flash_attn_pkg": 0.00048828125
+  },
+  "flash_attn_version": "2.8.3.post1",
+  "results": [
+    {
+      "impl": "ours",
+      "causal": false,
+      "seq_len": 1024,
+      "latency_ms": 0.15597012639045715,
+      "tflops": 55.07422985922235,
+      "status": "ok"
+    },
+    {
+      "impl": "sdpa",
+      "causal": false,
+      "seq_len": 1024,
+      "latency_ms": 0.11158735305070877,
+      "tflops": 76.97946368614431,
+      "status": "ok"
+    },
+    {
+      "impl": "triton_tutorial",
+      "causal": false,
+      "seq_len": 1024,
+      "latency_ms": 0.09917772561311722,
+      "tflops": 86.61153035015654,
+      "status": "ok"
+    },
+    {
+      "impl": "flash_attn_pkg",
+      "causal": false,
+      "seq_len": 1024,
+      "latency_ms": 0.11402316391468048,
+      "tflops": 75.33499595246757,
+      "status": "ok"
+    },
+    {
+      "impl": "ours",
+      "causal": false,
+      "seq_len": 2048,
+      "latency_ms": 0.5234933495521545,
+      "tflops": 65.63548208853952,
+      "status": "ok"
+    },
+    {
+      "impl": "sdpa",
+      "causal": false,
+      "seq_len": 2048,
+      "latency_ms": 0.41473811864852905,
+      "tflops": 82.84682989826227,
+      "status": "ok"
+    },
+    {
+      "impl": "triton_tutorial",
+      "causal": false,
+      "seq_len": 2048,
+      "latency_ms": 0.39429786801338196,
+      "tflops": 87.14157786628932,
+      "status": "ok"
+    },
+    {
+      "impl": "flash_attn_pkg",
+      "causal": false,
+      "seq_len": 2048,
+      "latency_ms": 0.4422428011894226,
+      "tflops": 77.6942853011709,
+      "status": "ok"
+    },
+    {
+      "impl": "ours",
+      "causal": false,
+      "seq_len": 4096,
+      "latency_ms": 2.1548471450805664,
+      "tflops": 63.78130058355548,
+      "status": "ok"
+    },
+    {
+      "impl": "sdpa",
+      "causal": false,
+      "seq_len": 4096,
+      "latency_ms": 1.6942235231399536,
+      "tflops": 81.12209020524068,
+      "status": "ok"
+    },
+    {
+      "impl": "triton_tutorial",
+      "causal": false,
+      "seq_len": 4096,
+      "latency_ms": 1.647797703742981,
+      "tflops": 83.4076617292321,
+      "status": "ok"
+    },
+    {
+      "impl": "flash_attn_pkg",
+      "causal": false,
+      "seq_len": 4096,
+      "latency_ms": 1.812001347541809,
+      "tflops": 75.84925566333158,
+      "status": "ok"
+    },
+    {
+      "impl": "ours",
+      "causal": false,
+      "seq_len": 8192,
+      "latency_ms": 8.588092803955078,
+      "tflops": 64.01372533315205,
+      "status": "ok"
+    },
+    {
+      "impl": "sdpa",
+      "causal": false,
+      "seq_len": 8192,
+      "latency_ms": 6.836575984954834,
+      "tflops": 80.41391115930558,
+      "status": "ok"
+    },
+    {
+      "impl": "triton_tutorial",
+      "causal": false,
+      "seq_len": 8192,
+      "latency_ms": 6.714970111846924,
+      "tflops": 81.87018031816557,
+      "status": "ok"
+    },
+    {
+      "impl": "flash_attn_pkg",
+      "causal": false,
+      "seq_len": 8192,
+      "latency_ms": 7.227571964263916,
+      "tflops": 76.0636928426612,
+      "status": "ok"
+    },
+    {
+      "impl": "ours",
+      "causal": true,
+      "seq_len": 1024,
+      "latency_ms": 0.13053707778453827,
+      "tflops": 32.90227856248768,
+      "status": "ok"
+    },
+    {
+      "impl": "sdpa",
+      "causal": true,
+      "seq_len": 1024,
+      "latency_ms": 0.09003403037786484,
+      "tflops": 47.70382129928432,
+      "status": "ok"
+    },
+    {
+      "impl": "triton_tutorial",
+      "causal": true,
+      "seq_len": 1024,
+      "latency_ms": 0.08340233564376831,
+      "tflops": 51.49696663586079,
+      "status": "ok"
+    },
+    {
+      "impl": "flash_attn_pkg",
+      "causal": true,
+      "seq_len": 1024,
+      "latency_ms": 0.09552233666181564,
+      "tflops": 44.96296307329427,
+      "status": "ok"
+    },
+    {
+      "impl": "ours",
+      "causal": true,
+      "seq_len": 2048,
+      "latency_ms": 0.3554937243461609,
+      "tflops": 48.32678612146513,
+      "status": "ok"
+    },
+    {
+      "impl": "sdpa",
+      "causal": true,
+      "seq_len": 2048,
+      "latency_ms": 0.27855145931243896,
+      "tflops": 61.675746472145,
+      "status": "ok"
+    },
+    {
+      "impl": "triton_tutorial",
+      "causal": true,
+      "seq_len": 2048,
+      "latency_ms": 0.2593417763710022,
+      "tflops": 66.2441255103585,
+      "status": "ok"
+    },
+    {
+      "impl": "flash_attn_pkg",
+      "causal": true,
+      "seq_len": 2048,
+      "latency_ms": 0.2845669090747833,
+      "tflops": 60.371985062694634,
+      "status": "ok"
+    },
+    {
+      "impl": "ours",
+      "causal": true,
+      "seq_len": 4096,
+      "latency_ms": 1.2706563472747803,
+      "tflops": 54.081874208856696,
+      "status": "ok"
+    },
+    {
+      "impl": "sdpa",
+      "causal": true,
+      "seq_len": 4096,
+      "latency_ms": 0.9948281645774841,
+      "tflops": 69.07673021620373,
+      "status": "ok"
+    },
+    {
+      "impl": "triton_tutorial",
+      "causal": true,
+      "seq_len": 4096,
+      "latency_ms": 0.9380378723144531,
+      "tflops": 73.2587441129554,
+      "status": "ok"
+    },
+    {
+      "impl": "flash_attn_pkg",
+      "causal": true,
+      "seq_len": 4096,
+      "latency_ms": 1.0206849575042725,
+      "tflops": 67.32682423774463,
+      "status": "ok"
+    },
+    {
+      "impl": "ours",
+      "causal": true,
+      "seq_len": 8192,
+      "latency_ms": 4.809017181396484,
+      "tflops": 57.15885316595574,
+      "status": "ok"
+    },
+    {
+      "impl": "sdpa",
+      "causal": true,
+      "seq_len": 8192,
+      "latency_ms": 3.8575360774993896,
+      "tflops": 71.25737813505738,
+      "status": "ok"
+    },
+    {
+      "impl": "triton_tutorial",
+      "causal": true,
+      "seq_len": 8192,
+      "latency_ms": 3.5798933506011963,
+      "tflops": 76.7838256839257,
+      "status": "ok"
+    },
+    {
+      "impl": "flash_attn_pkg",
+      "causal": true,
+      "seq_len": 8192,
+      "latency_ms": 4.000300884246826,
+      "tflops": 68.71430797279986,
+      "status": "ok"
+    }
+  ]
+}
